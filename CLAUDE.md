@@ -5,8 +5,7 @@
 **手順は共通の `~/.claude/CLAUDE.md`「修正が終わったら、リリースまで通す」に従う。**
 ここにはこのリポジトリ固有の事情だけを書く。
 
-- リモート: **まだ無い**(2026-10-04 時点。`git remote -v` が空のうちは、コミットまでで止める)。
-  作るなら `iosxi/iivnc-server`(ほかの兄弟と同じ)。
+- リモート: `https://github.com/iosxi/iivnc-server.git`(`iosxi/iivnc-server`)
 - ブランチ: **`master`**
 - 最新バージョンの確認: `git tag --sort=-v:refname | head -1`
 - リリースの添付物: **`iivnc-server.exe`**。改名せず、そのまま `gh release create` に渡す。
