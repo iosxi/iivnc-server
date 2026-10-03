@@ -34,8 +34,8 @@
 #include "zlite.h"
 
 #define APP_NAME     L"iivnc-server"
-#define APP_VERSION  L"1.0.0"
-#define APP_VERSION_A "1.0.0"
+#define APP_VERSION  L"1.1.0"
+#define APP_VERSION_A "1.1.0"
 
 #define WM_APP_TRAY     (WM_APP + 1)
 #define WM_APP_COMMAND  (WM_APP + 2)    /* 別のプロセスから(-exit など) */
@@ -43,6 +43,8 @@
 #define WM_APP_CLIENTS  (WM_APP + 4)    /* 接続の数が変わった */
 #define WM_APP_NOTIFY   (WM_APP + 5)    /* lParam = 知らせる文字(malloc した WCHAR*) */
 #define WM_APP_RESTART  (WM_APP + 6)    /* 待ち受けをやり直す(設定が変わった) */
+#define WM_APP_RELOAD   (WM_APP + 7)    /* 分身: 設定を読み直す */
+#define WM_APP_DISCONNECT (WM_APP + 8)  /* 分身: 全員を切断 */
 
 #define CMD_EXIT 1
 
@@ -61,6 +63,8 @@ typedef struct Config {
     int   theme;                /* 0 = システム、1 = ライト、2 = ダーク */
     int   log;
     int   maxFps;               /* 0 = 制限しない */
+    int   sasBefore;
+    int   selftest;             /* 検証用: 分身が起動 20 秒後に入力デスクトップを撮ってログに書く */            /* サービス登録の前の SoftwareSASGeneration(-1 = 無かった、-2 = 控えていない) */
 } Config;
 
 extern Config g_cfg;
@@ -330,6 +334,42 @@ void     theme_allow_dark(HWND hwnd);
 void     theme_apply_dialog(HWND dlg);
 LRESULT  theme_ctlcolor(UINT msg, HDC dc, HWND ctl, BOOL dimText);
 BOOL     theme_custom_draw_button(NMCUSTOMDRAW *cd, LRESULT *result);
+
+/* ------------------------------------------------------------------ */
+/*  サービス(svc.c)                                                    */
+/* ------------------------------------------------------------------ */
+
+enum { RUN_NORMAL, RUN_AGENT };
+extern int  g_runMode;
+extern BOOL g_uiService;        /* 設定画面がサービスの設定(管理者)として開いている */
+
+typedef struct SvcStatus {      /* 分身 → トレイ・設定画面(共有メモリ) */
+    LONG  version, seq;
+    LONG  listening, port, clients, notifySeq;
+    WCHAR method[32];
+    WCHAR listen[64];
+    WCHAR error[160];
+    WCHAR notify[256];
+    WCHAR clientList[2048];
+} SvcStatus;
+
+int  svc_service_main(void);                /* -service */
+int  svc_tray_main(int cmd);                /* -tray */
+int  svc_install_cmd(void);                 /* -install-service(管理者) */
+BOOL svc_uninstall(HWND owner);             /* 管理者で */
+BOOL svc_installed(void);                   /* この ini で登録されているか */
+BOOL svc_path_risky(WCHAR *who, int cap);
+BOOL svc_run_elevated(const WCHAR *args, HWND owner, BOOL wait, DWORD *exitCode);
+BOOL svc_read_status(SvcStatus *st);
+void svc_signal_disconnect(void);
+void svc_signal_reload(void);
+void svc_firewall(BOOL add);
+BOOL agent_init(void);
+void agent_status_update(void);
+void agent_notify(const WCHAR *s);
+void agent_request_sas(void);
+BOOL agent_follow_input_desktop(void);      /* 呼んだスレッドを入力デスクトップへ。移ったら TRUE */
+BOOL agent_input_desktop_changed(void);
 
 /* main.c */
 void app_notify(const WCHAR *fmt, ...);     /* 通知(バルーン)を出す。どのスレッドからでもよい */

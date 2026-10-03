@@ -7,6 +7,15 @@
  *  iivnc-server.exe -ini <path>     別の設定ファイルで動かす(多重起動の判定も別)
  *  iivnc-server.exe -log            ログを書く(ini の log=1 と同じ)
  *
+ *  サービスとして(svc.c):
+ *  -install-service    管理者で: サービスとして登録して始める(設定画面のボタンから呼ぶ)
+ *  -uninstall-service  管理者で: サービスを止めて登録を消す(ポリシーとファイアウォールも戻す)
+ *  -service            サービス本体(SCM から起動される)
+ *  -agent              分身(サービスがコンソールのセッションへ SYSTEM で起動する)
+ *  -tray               ログインしたユーザーのトレイ(サービスが起動する)
+ *  -svcsettings        管理者で: サービスの設定画面
+ *  サービスとして登録されているときに、同じ ini でふつうに起動すると -tray になる。
+ *
  *  検証用:
  *  -testsrc [static|video]  画面の代わりに合成した絵を出す(利用者の画面を写さない)。
  *                      video は全面が毎フレーム変わる(動画のような)絵。
@@ -33,6 +42,7 @@
 enum { ID_SETTINGS = 100, ID_DISCONNECT_ALL, ID_EXIT };
 
 HWND  g_mainWnd;
+int   g_runMode = RUN_NORMAL;
 BOOL  g_dryRun;
 int   g_testSrc;
 int   g_testFrames;
@@ -66,9 +76,15 @@ void app_notify(const WCHAR *fmt, ...)
 void app_listen_addresses(WCHAR *buf, int cap)
 {
     ULONG size = 16384;
-    IP_ADAPTER_ADDRESSES *aa = (IP_ADAPTER_ADDRESSES *)malloc(size), *a;
+    IP_ADAPTER_ADDRESSES *aa, *a;
     int used = 0;
+    static BOOL wsa;
     buf[0] = 0;
+    if (!wsa) {                         /* 設定画面だけのプロセスでも WSAAddressToString を使えるように */
+        WSADATA wd;
+        wsa = WSAStartup(MAKEWORD(2, 2), &wd) == 0;
+    }
+    aa = (IP_ADAPTER_ADDRESSES *)malloc(size);
     if (!aa) return;
     if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size) == ERROR_BUFFER_OVERFLOW) {
         free(aa);
@@ -99,6 +115,7 @@ void app_listen_addresses(WCHAR *buf, int cap)
 void app_update_tray(void)
 {
     int n = (int)g_clientCount;
+    if (g_runMode == RUN_AGENT) { agent_status_update(); return; }
     g_nid.uFlags = NIF_ICON | NIF_TIP;
     g_nid.hIcon = n ? g_icoActive : g_icoIdle;
     if (!g_listening) _snwprintf(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"iivnc-server - 待ち受けていません");
@@ -214,6 +231,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_APP_NOTIFY: {
         WCHAR *s = (WCHAR *)lp;
+        if (g_runMode == RUN_AGENT) { agent_notify(s); free(s); return 0; }
         g_nid.uFlags = NIF_INFO;
         lstrcpynW(g_nid.szInfo, s, ARRAYSIZE(g_nid.szInfo));
         lstrcpyW(g_nid.szInfoTitle, L"iivnc-server");
@@ -229,6 +247,28 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         start_listening();
         return 0;
 
+    case WM_APP_RELOAD: {               /* 分身: 管理者の設定画面で変わった */
+        Config old = g_cfg;
+        config_load();
+        log_printf(L"[agent] 設定を読み直した");
+        if (old.port != g_cfg.port || lstrcmpW(old.listen, g_cfg.listen) || (!g_listening && may_listen())) {
+            server_stop();
+            start_listening();
+        }
+        if (old.display != g_cfg.display) capture_reset();
+        agent_status_update();
+        return 0;
+    }
+
+    case WM_APP_DISCONNECT:
+        server_disconnect_all();
+        return 0;
+
+    case WM_TIMER:                      /* 分身: 待ち受けられなかったら、やり直す */
+        if (!g_listening && may_listen()) start_listening();
+        else agent_status_update();
+        return 0;
+
     case WM_APP_SETCLIP:
         clip_set_from_remote(hwnd, (WCHAR *)lp);
         return 0;
@@ -242,11 +282,11 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        if (g_runMode != RUN_AGENT) Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
     }
-    if (msg == g_wmTaskbarCreated && msg) {     /* エクスプローラが再起動した */
+    if (msg == g_wmTaskbarCreated && msg && g_runMode != RUN_AGENT) {     /* エクスプローラが再起動した */
         tray_add();
         return 0;
     }
@@ -271,12 +311,13 @@ static void mutex_name(WCHAR *out)
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 {
     WCHAR   mname[64];
-    HANDLE  mutex;
+    HANDLE  mutex = NULL;
     WNDCLASSW wc;
     MSG     msg;
     LPWSTR *argv;
     int     argc, i, cmd = 0;
     BOOL    openSettings = FALSE, first, logArg = FALSE;
+    int     svcMode = 0;            /* 1 = -service、2 = -agent、3 = -tray、4 = -svcsettings、5 = -install-service、6 = -uninstall-service */
     INITCOMMONCONTROLSEX icc;
 
     (void)prev; (void)cmdline; (void)show;
@@ -293,6 +334,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         else if (!lstrcmpiW(a, L"settings")) openSettings = TRUE;
         else if (!lstrcmpiW(a, L"dryrun")) g_dryRun = TRUE;
         else if (!lstrcmpiW(a, L"gdi")) g_forceGdi = TRUE;
+        else if (!lstrcmpiW(a, L"service")) svcMode = 1;
+        else if (!lstrcmpiW(a, L"agent")) svcMode = 2;
+        else if (!lstrcmpiW(a, L"tray")) svcMode = 3;
+        else if (!lstrcmpiW(a, L"svcsettings")) svcMode = 4;
+        else if (!lstrcmpiW(a, L"install-service")) svcMode = 5;
+        else if (!lstrcmpiW(a, L"uninstall-service")) svcMode = 6;
         else if (!lstrcmpiW(a, L"testsrc")) {
             g_testSrc = 1;
             g_dryRun = TRUE;
@@ -306,7 +353,51 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     if (argv) LocalFree(argv);
     config_init();
 
-    /* 同じ設定ファイルで動いているものがあれば、そちらに頼んで終わる */
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icc);
+
+    switch (svcMode) {
+    case 1:                             /* サービス本体 */
+        config_load();
+        if (logArg) g_cfg.log = TRUE;
+        log_open();
+        return svc_service_main();
+    case 3:                             /* トレイ */
+        return svc_tray_main(cmd);
+    case 4: {                           /* サービスの設定画面(管理者) */
+        config_load();
+        log_open();
+        theme_init();
+        g_uiService = TRUE;
+        ui_show_settings(NULL);
+        while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+            if (ui_dialog_message(&msg)) continue;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        return 0;
+    }
+    case 5:                             /* 登録(管理者) */
+        config_load();
+        if (logArg) g_cfg.log = TRUE;
+        log_open();
+        return svc_install_cmd();
+    case 6:                             /* 解除(管理者) */
+        config_load();
+        if (logArg) g_cfg.log = TRUE;
+        log_open();
+        return svc_uninstall(NULL) ? 0 : 2;
+    case 2:
+        g_runMode = RUN_AGENT;
+        break;
+    default:
+        /* この ini でサービスとして登録されているなら、トレイだけを出す */
+        if (!g_testSrc && svc_installed()) return svc_tray_main(cmd);
+    }
+
+    /* 同じ設定ファイルで動いているものがあれば、そちらに頼んで終わる(分身は除く) */
+    if (g_runMode == RUN_AGENT) goto skip_mutex;
     mutex_name(mname);
     mutex = CreateMutexW(NULL, FALSE, mname);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -331,10 +422,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         if (mutex) CloseHandle(mutex);
         return 0;
     }
-
-    icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
-    InitCommonControlsEx(&icc);
+skip_mutex:
 
     first = GetFileAttributesW(g_iniPath) == INVALID_FILE_ATTRIBUTES;
     config_load();
@@ -342,7 +430,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     log_open();
     theme_init();
     if (first) config_save();
-    log_printf(L"iivnc-server %s 起動 (設定 %s)%s%s", APP_VERSION, g_iniPath,
+    log_printf(L"iivnc-server %s 起動 (設定 %s)%s%s%s", APP_VERSION, g_iniPath, g_runMode == RUN_AGENT ? L" [agent]" : L"",
                g_testSrc ? L" 検証用の絵" : L"", g_dryRun ? L" 入力はログだけ" : L"");
 
     g_icoIdle   = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
@@ -355,19 +443,27 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     wc.lpszClassName = TRAY_CLASS;
     RegisterClassW(&wc);
     /* 別のインスタンスが探せるよう、タイトルに設定ファイルのパスを入れておく */
-    g_mainWnd = CreateWindowExW(WS_EX_TOOLWINDOW, TRAY_CLASS, g_iniPath, WS_POPUP, 0, 0, 0, 0, NULL, NULL, inst, NULL);
+    g_mainWnd = CreateWindowExW(WS_EX_TOOLWINDOW, TRAY_CLASS, g_runMode == RUN_AGENT ? L"iivnc-server agent" : g_iniPath,
+                                WS_POPUP, 0, 0, 0, 0, NULL, NULL, inst, NULL);
     if (!g_mainWnd) return 1;
-    ChangeWindowMessageFilterEx(g_mainWnd, g_wmTaskbarCreated, MSGFLT_ALLOW, NULL);
-    ChangeWindowMessageFilterEx(g_mainWnd, WM_APP_COMMAND, MSGFLT_ALLOW, NULL);
-    theme_allow_dark(g_mainWnd);
-    tray_add();
+    if (g_runMode == RUN_AGENT) {
+        agent_init();
+        SetTimer(g_mainWnd, 1, 5000, NULL);
+    } else {
+        ChangeWindowMessageFilterEx(g_mainWnd, g_wmTaskbarCreated, MSGFLT_ALLOW, NULL);
+        ChangeWindowMessageFilterEx(g_mainWnd, WM_APP_COMMAND, MSGFLT_ALLOW, NULL);
+        theme_allow_dark(g_mainWnd);
+        tray_add();
+    }
 
     pool_init();
     capture_init();
     clip_init(g_mainWnd);
     start_listening();
-    if (!g_listening && !may_listen()) openSettings = TRUE;
-    if (openSettings) ui_show_settings(NULL);
+    if (g_runMode != RUN_AGENT) {
+        if (!g_listening && !may_listen()) openSettings = TRUE;
+        if (openSettings) ui_show_settings(NULL);
+    }
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         if (ui_dialog_message(&msg)) continue;

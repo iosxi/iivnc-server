@@ -15,6 +15,10 @@
  *     「@」を英語配列で打つ、など)。見つからない文字は Unicode で打つ。
  *
  *  -dryrun のときは再現せずログに書く。
+ *
+ *  サービスの分身(SYSTEM)として動いているときは、送る前に入力デスクトップ
+ *  (ログイン画面・ロック画面・UAC の確認画面は Winlogon)へスレッドを移す。
+ *  Ctrl+Alt+Del は SendInput では起きないので、サービスに SendSAS を頼む。
  *  普通の権限で動いていると、管理者のウィンドウへは届かない(UIPI)。
  * ================================================================== */
 
@@ -55,6 +59,7 @@ static void send_inputs(INPUT *in, int n)
         if (in[i].type == INPUT_MOUSE) in[i].mi.dwExtraInfo = INJECT_MAGIC;
         else in[i].ki.dwExtraInfo = INJECT_MAGIC;
     }
+    if (g_runMode == RUN_AGENT) agent_follow_input_desktop();
     if (g_dryRun) {
         for (i = 0; i < n; i++) {
             if (in[i].type == INPUT_MOUSE)
@@ -213,6 +218,12 @@ void input_key(Client *c, BOOL down, unsigned keysym)
     hkl = target_layout();
     jp = PRIMARYLANGID(LOWORD((DWORD_PTR)hkl)) == LANG_JAPANESE;
 
+    /* Ctrl+Alt+Del: サービスの分身なら SendSAS を頼む */
+    if (down && (keysym == 0xffff || keysym == 0xff9f) && s->ctrl && s->alt && g_runMode == RUN_AGENT) {
+        agent_request_sas();
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
     if (!down) {
         Pressed *p = find_pressed(s, keysym);
         if (p) {
@@ -327,6 +338,11 @@ void input_qemu_key(Client *c, BOOL down, unsigned keysym, unsigned keycode)
     }
     EnterCriticalSection(&g_cs);
     track_mods(s, keysym, down);
+    if (down && (keycode == 0xD3 || keycode == 0x53) && s->ctrl && s->alt && g_runMode == RUN_AGENT) {
+        agent_request_sas();
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
     scan = (WORD)(keycode & 0x7F);
     fl = KEYEVENTF_SCANCODE | ((keycode & 0x80) ? KEYEVENTF_EXTENDEDKEY : 0);
     key_event(&in[0], 0, scan, fl | (down ? 0 : KEYEVENTF_KEYUP));

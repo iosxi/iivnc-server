@@ -34,6 +34,7 @@ void config_init(void)
     ZeroMemory(&g_cfg, sizeof(g_cfg));
     g_cfg.port   = 5900;
     g_cfg.notify = 1;
+    g_cfg.sasBefore = -2;
 }
 
 /* ------------------------------------------------------------------ */
@@ -136,6 +137,8 @@ void config_load(void)
         else if (!_stricmp(key, "maxfps")) g_cfg.maxFps = atoi(val);
         else if (!_stricmp(key, "theme")) g_cfg.theme = !_stricmp(val, "light") ? 1 : !_stricmp(val, "dark") ? 2 : 0;
         else if (!_stricmp(key, "log")) g_cfg.log = atoi(val) != 0;
+        else if (!_stricmp(key, "sas_before")) g_cfg.sasBefore = atoi(val);
+        else if (!_stricmp(key, "selftest")) g_cfg.selftest = atoi(val) != 0;
     }
     free(text);
     if (g_cfg.port <= 0 || g_cfg.port > 65535) g_cfg.port = 5900;
@@ -149,7 +152,7 @@ void config_load(void)
 
 BOOL config_save(void)
 {
-    char   buf[2048], pw[20], vpw[20], *listen;
+    char   buf[3072], pw[20], vpw[20], *listen;
     WCHAR  tmp[MAX_PATH + 8];
     HANDLE f;
     DWORD  wr;
@@ -182,9 +185,12 @@ BOOL config_save(void)
         "; system / light / dark\n"
         "theme=%s\n"
         "; 1 = iivnc-server.log に動作の記録を書く\n"
-        "log=%d\n",
+        "log=%d\n"
+        "\n[service]\n"
+        "; サービスとして登録する前の SoftwareSASGeneration(解除のときに戻す。-1 = 無かった、-2 = 控えていない)\n"
+        "sas_before=%d\n",
         g_cfg.port, listen ? listen : "", pw, vpw, g_cfg.viewOnly, g_cfg.display, g_cfg.notify, g_cfg.maxFps,
-        g_cfg.theme == 1 ? "light" : g_cfg.theme == 2 ? "dark" : "system", g_cfg.log);
+        g_cfg.theme == 1 ? "light" : g_cfg.theme == 2 ? "dark" : "system", g_cfg.log, g_cfg.sasBefore);
     free(listen);
     if (n < 0) return FALSE;
 

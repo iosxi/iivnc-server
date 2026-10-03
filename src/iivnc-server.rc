@@ -13,7 +13,7 @@ IDI_ACTIVE ICON "iivnc-server-active.ico"
 // ------------------------------------------------------------------
 //  設定画面
 // ------------------------------------------------------------------
-IDD_SETTINGS DIALOGEX 0, 0, 320, 300
+IDD_SETTINGS DIALOGEX 0, 0, 320, 338
 STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "iivnc-server"
@@ -40,18 +40,22 @@ BEGIN
     COMBOBOX        IDC_DISPLAY, 106, 211, 202, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     AUTOCHECKBOX    "見るだけにする(誰にも操作させない)(&W)", IDC_VIEWONLY, 12, 230, 296, 10
     AUTOCHECKBOX    "接続・切断を通知で知らせる(&N)", IDC_NOTIFY, 12, 244, 296, 10
-    LTEXT           "", IDC_INIPATH, 12, 259, 296, 9, SS_PATHELLIPSIS | SS_NOPREFIX
 
-    DEFPUSHBUTTON   "OK", IDOK, 196, 280, 54, 14
-    PUSHBUTTON      "キャンセル", IDCANCEL, 254, 280, 54, 14
+    LTEXT           "Windows の起動時から", IDC_H_SERVICE, 12, 262, 200, 11
+    LTEXT           "", IDC_SVCTEXT, 12, 276, 214, 18, SS_NOPREFIX
+    PUSHBUTTON      "", IDC_SERVICE, 232, 276, 76, 15
+    LTEXT           "", IDC_INIPATH, 12, 298, 296, 9, SS_PATHELLIPSIS | SS_NOPREFIX
+
+    DEFPUSHBUTTON   "OK", IDOK, 196, 318, 54, 14
+    PUSHBUTTON      "キャンセル", IDCANCEL, 254, 318, 54, 14
 END
 
 // ------------------------------------------------------------------
 //  版
 // ------------------------------------------------------------------
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1, 0, 0, 0
-PRODUCTVERSION  1, 0, 0, 0
+FILEVERSION     1, 1, 0, 0
+PRODUCTVERSION  1, 1, 0, 0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -61,11 +65,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "iosxi"
             VALUE "FileDescription",  "iivnc-server (VNC サーバー)"
-            VALUE "FileVersion",      "1.0.0"
+            VALUE "FileVersion",      "1.1.0"
             VALUE "InternalName",     "iivnc-server"
             VALUE "OriginalFilename", "iivnc-server.exe"
             VALUE "ProductName",      "iivnc"
-            VALUE "ProductVersion",   "1.0.0"
+            VALUE "ProductVersion",   "1.1.0"
         END
     END
     BLOCK "VarFileInfo"

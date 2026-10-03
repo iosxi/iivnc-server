@@ -21,3 +21,6 @@
 #define IDC_NOTIFY       1015
 #define IDC_INIPATH      1016
 #define IDC_HINT_PW      1017
+#define IDC_H_SERVICE    1018
+#define IDC_SVCTEXT      1019
+#define IDC_SERVICE      1020

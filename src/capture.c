@@ -1005,6 +1005,8 @@ static void close_capture(void)
 
 static BOOL open_capture(void)
 {
+    /* サービスの分身: 今の入力デスクトップ(ログイン画面・ロック画面・UAC は Winlogon)へ移ってから開く */
+    if (g_runMode == RUN_AGENT && !g_testSrc) agent_follow_input_desktop();
     if (g_testSrc) {
         g_mode = MODE_TEST;
         lstrcpyW(g_scr.method, L"検証用");
@@ -1064,6 +1066,17 @@ static DWORD WINAPI capture_thread(void *arg)
         }
 
         if (InterlockedExchange(&g_reset, 0) && g_mode != MODE_NONE) close_capture();
+        /* サービスの分身: 入力デスクトップが替わったら開き直す(GDI は替わっても失敗しない) */
+        if (g_runMode == RUN_AGENT && g_mode != MODE_NONE && !g_testSrc) {
+            static DWORD lastCheck;
+            if (GetTickCount() - lastCheck >= 250) {
+                lastCheck = GetTickCount();
+                if (agent_input_desktop_changed()) {
+                    log_printf(L"[agent] 入力デスクトップが替わった");
+                    close_capture();
+                }
+            }
+        }
         if (g_mode == MODE_NONE) {
             if (!open_capture()) {
                 Sleep(500);

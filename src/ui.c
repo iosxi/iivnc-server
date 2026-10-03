@@ -6,6 +6,10 @@
  *  取り込みに関わる項目が変わっていればやり直す。
  *
  *  パスワード欄は空のまま OK なら変えない(今の値は画面に出さない)。
+ *
+ *  サービスとして動いているときは、トレイから管理者として開かれる
+ *  (-svcsettings、g_uiService)。状態は分身の共有メモリから読み、OK で ini に
+ *  書いて分身に読み直させる。「サービスとして登録」「サービスをやめる」もここ。
  * ================================================================== */
 
 #include "iivnc.h"
@@ -30,11 +34,33 @@ static void set_status(HWND dlg)
 {
     WCHAR s[1024], addrs[512], list[2048];
     int   n;
+    if (g_uiService) {
+        SvcStatus st;
+        if (!svc_read_status(&st)) {
+            lstrcpyW(s, L"サービスとして登録されていますが、まだ動いていません(始まるまで数秒かかります)。");
+            n = 0;
+        } else {
+            app_listen_addresses(addrs, ARRAYSIZE(addrs));
+            if (!st.listening)
+                _snwprintf(s, ARRAYSIZE(s), L"サービスとして動いています。%s", st.error[0] ? st.error : L"待ち受けていません。");
+            else if (st.listen[0])
+                _snwprintf(s, ARRAYSIZE(s), L"サービスとして動いています。%s:%ld で待ち受けています。\n取り込み: %s",
+                           st.listen, st.port, lstrcmpW(st.method, L"-") ? st.method : L"(接続が来たら始めます)");
+            else
+                _snwprintf(s, ARRAYSIZE(s), L"サービスとして動いています。ポート %ld で待ち受けています。このPC のアドレス: %s\n取り込み: %s",
+                           st.port, addrs[0] ? addrs : L"(不明)", lstrcmpW(st.method, L"-") ? st.method : L"(接続が来たら始めます)");
+            lstrcpynW(list, st.clientList, ARRAYSIZE(list));
+            n = st.clients;
+        }
+        s[ARRAYSIZE(s) - 1] = 0;
+        SetDlgItemTextW(dlg, IDC_STATUS, s);
+        goto clients;
+    }
     if (app_listening()) {
         const WCHAR *method = lstrcmpW(g_scr.method, L"-") ? g_scr.method : L"(接続が来たら始めます)";
         app_listen_addresses(addrs, ARRAYSIZE(addrs));
         if (g_cfg.listen[0])
-            _snwprintf(s, ARRAYSIZE(s), L"%s:%d で待ち受けています。\n取り込み: %s", g_cfg.listen, g_cfg.port, g_scr.method);
+            _snwprintf(s, ARRAYSIZE(s), L"%s:%d で待ち受けています。\n取り込み: %s", g_cfg.listen, g_cfg.port, method);
         else
             _snwprintf(s, ARRAYSIZE(s), L"ポート %d で待ち受けています。このPC のアドレス: %s\n取り込み: %s",
                        g_cfg.port, addrs[0] ? addrs : L"(不明)", method);
@@ -45,6 +71,7 @@ static void set_status(HWND dlg)
     SetDlgItemTextW(dlg, IDC_STATUS, s);
 
     n = server_list(list, ARRAYSIZE(list));
+clients:
     SendDlgItemMessageW(dlg, IDC_CLIENTS, WM_SETREDRAW, FALSE, 0);
     SendDlgItemMessageW(dlg, IDC_CLIENTS, LB_RESETCONTENT, 0, 0);
     if (n) {
@@ -123,6 +150,13 @@ static void fill(HWND dlg)
     for (i = 0; i < n; i++)
         if ((int)SendMessageW(dc, CB_GETITEMDATA, (WPARAM)i, 0) == g_cfg.display) SendMessageW(dc, CB_SETCURSEL, (WPARAM)i, 0);
 
+    if (g_uiService) {
+        SetDlgItemTextW(dlg, IDC_SVCTEXT, L"サービスとして動いています。ログイン前・ロック中・UAC の確認画面でも接続できます。");
+        SetDlgItemTextW(dlg, IDC_SERVICE, L"サービスをやめる(&V)...");
+    } else {
+        SetDlgItemTextW(dlg, IDC_SVCTEXT, L"サービスとして登録すると、ログイン前・ロック中・UAC の確認画面でも接続できます。");
+        SetDlgItemTextW(dlg, IDC_SERVICE, L"サービスにする(&V)...");
+    }
     CheckDlgButton(dlg, IDC_VIEWONLY, g_cfg.viewOnly ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, IDC_NOTIFY, g_cfg.notify ? BST_CHECKED : BST_UNCHECKED);
     {
@@ -201,9 +235,91 @@ static BOOL apply(HWND dlg)
     SecureZeroMemory(newVpw, sizeof(newVpw));
 
     if (!config_save()) message(dlg, L"設定を保存できませんでした。", g_iniPath);
+    if (g_uiService) {
+        /* サービス: ファイアウォールの規則のポートを合わせ、分身に読み直させる */
+        if (restart) svc_firewall(lstrcmpW(g_cfg.listen, L"127.0.0.1") != 0);
+        svc_signal_reload();
+        return TRUE;
+    }
     if (recapture) capture_reset();
     if (restart || !app_listening()) PostMessageW(g_mainWnd, WM_APP_RESTART, 0, 0);
     return TRUE;
+}
+
+static int confirm(HWND owner, const WCHAR *main, const WCHAR *content, const WCHAR *yes, PCWSTR icon)
+{
+    TASKDIALOGCONFIG  tc;
+    TASKDIALOG_BUTTON b[1];
+    int pressed = IDCANCEL;
+    b[0].nButtonID = IDYES;
+    b[0].pszButtonText = yes;
+    ZeroMemory(&tc, sizeof(tc));
+    tc.cbSize = sizeof(tc);
+    tc.hwndParent = owner;
+    tc.hInstance = g_inst;
+    tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_SIZE_TO_CONTENT;
+    tc.pszWindowTitle = APP_NAME;
+    tc.pszMainIcon = icon;
+    tc.pszMainInstruction = main;
+    tc.pszContent = content;
+    tc.pButtons = b;
+    tc.cButtons = 1;
+    tc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    tc.nDefaultButton = IDCANCEL;
+    if (FAILED(TaskDialogIndirect(&tc, &pressed, NULL, NULL))) pressed = IDCANCEL;
+    return pressed;
+}
+
+/* ふだんのトレイ常駐から: サービスとして登録する */
+static void install_service(HWND dlg)
+{
+    WCHAR who[256], text[1024];
+    DWORD code = 1;
+
+    if (!apply(dlg)) return;
+    if (!g_cfg.password[0] && !g_cfg.viewPassword[0] && lstrcmpW(g_cfg.listen, L"127.0.0.1")) {
+        message(dlg, L"パスワードを設定してから登録してください。", NULL);
+        return;
+    }
+    if (svc_path_risky(who, ARRAYSIZE(who))) {
+        _snwprintf(text, ARRAYSIZE(text),
+                   L"iivnc-server.exe のある場所(%s)は、%s が書き換えられます。\n\n"
+                   L"サービスは SYSTEM(この PC のすべての権限)で動くので、この exe を差し替えられると、"
+                   L"差し替えた人やプログラムが PC のすべての権限を得られます。"
+                   L"自分しか使わない PC なら、そのままでも実害は小さいです。",
+                   g_exeDir, who);
+        text[ARRAYSIZE(text) - 1] = 0;
+        if (confirm(dlg, L"この場所のままサービスにしますか？", text, L"このまま登録する", TD_WARNING_ICON) != IDYES) return;
+    }
+    _snwprintf(text, ARRAYSIZE(text),
+               L"Windows の起動時から動き、ログイン前・ロック中・UAC の確認画面でも接続できるようになります。\n\n"
+               L"・管理者の確認が出ます。\n"
+               L"・Ctrl+Alt+Del を送れるよう、Windows のポリシー(SoftwareSASGeneration)を設定します。サービスをやめると元に戻します。\n"
+               L"・Windows ファイアウォールに、ポート %d への受信を許可する規則を足します。\n"
+               L"・このトレイ常駐は終わり、サービスがトレイを出し直します。",
+               g_cfg.port);
+    text[ARRAYSIZE(text) - 1] = 0;
+    if (confirm(dlg, L"サービスとして登録しますか？", text, L"登録する", TD_SHIELD_ICON) != IDYES) return;
+
+    server_stop();                      /* ポートを空ける(サービスの分身が使う) */
+    if (!svc_run_elevated(L"-install-service", dlg, TRUE, &code) || code != 0) {
+        PostMessageW(g_mainWnd, WM_APP_RESTART, 0, 0);
+        return;
+    }
+    log_printf(L"サービスとして登録した。トレイ常駐を終わる");
+    DestroyWindow(dlg);
+    PostMessageW(g_mainWnd, WM_APP_COMMAND, CMD_EXIT, 0);
+}
+
+/* サービスの設定画面(管理者)から: サービスをやめる */
+static void uninstall_service(HWND dlg)
+{
+    if (confirm(dlg, L"サービスをやめますか？",
+                L"ログイン前・ロック中・UAC の確認画面では接続できなくなります。\n"
+                L"Ctrl+Alt+Del のポリシーとファイアウォールの規則は元に戻します。\n"
+                L"ログインしているなら、ふだんのトレイ常駐で動き直します。",
+                L"サービスをやめる", TD_WARNING_ICON) != IDYES) return;
+    if (svc_uninstall(dlg)) DestroyWindow(dlg);
 }
 
 static void apply_theme(HWND dlg)
@@ -218,7 +334,7 @@ static INT_PTR CALLBACK dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         LOGFONTW lf;
         HFONT    base = (HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0);
         RECT     r, pad = { 0, 0, 0, 7 };
-        static const int heads[] = { IDC_H_STATUS, IDC_H_CLIENTS, IDC_H_CONN };
+        static const int heads[] = { IDC_H_STATUS, IDC_H_CLIENTS, IDC_H_CONN, IDC_H_SERVICE };
         int i;
         HICON ic = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
         HICON ib = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
@@ -229,7 +345,7 @@ static INT_PTR CALLBACK dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
             lf.lfHeight = MulDiv(lf.lfHeight, 118, 100);
             g_heading = CreateFontIndirectW(&lf);
         }
-        for (i = 0; i < 3; i++) if (g_heading) SendDlgItemMessageW(dlg, heads[i], WM_SETFONT, (WPARAM)g_heading, TRUE);
+        for (i = 0; i < 4; i++) if (g_heading) SendDlgItemMessageW(dlg, heads[i], WM_SETFONT, (WPARAM)g_heading, TRUE);
         GetWindowRect(GetDlgItem(dlg, IDOK), &r);
         MapWindowPoints(NULL, dlg, (POINT *)&r, 2);
         MapDialogRect(dlg, &pad);
@@ -293,7 +409,12 @@ static INT_PTR CALLBACK dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
             EnableWindow(GetDlgItem(dlg, IDC_VIEWPW), IsDlgButtonChecked(dlg, IDC_USEVIEWPW) == BST_CHECKED);
             return TRUE;
         case IDC_DISCONNECT:
-            server_disconnect_all();
+            if (g_uiService) svc_signal_disconnect();
+            else server_disconnect_all();
+            return TRUE;
+        case IDC_SERVICE:
+            if (g_uiService) uninstall_service(dlg);
+            else install_service(dlg);
             return TRUE;
         case IDOK:
             if (apply(dlg)) DestroyWindow(dlg);
@@ -310,6 +431,7 @@ static INT_PTR CALLBACK dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         g_heading = NULL;
         RemovePropW(dlg, L"iivnc.footer");
         g_dlg = NULL;
+        if (g_uiService) PostQuitMessage(0);     /* 設定画面だけのプロセス */
         return TRUE;
     }
     return FALSE;
