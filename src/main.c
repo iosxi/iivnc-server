@@ -1,0 +1,383 @@
+/* ==================================================================
+ * main.c - 起動、タスクトレイ、多重起動の判定
+ *
+ *  iivnc-server.exe                 起動してトレイに常駐し、待ち受ける
+ *  iivnc-server.exe -settings       設定画面を開く(動いていればそちらで)
+ *  iivnc-server.exe -exit           動いている iivnc-server を終わらせる(終わるまで待つ)
+ *  iivnc-server.exe -ini <path>     別の設定ファイルで動かす(多重起動の判定も別)
+ *  iivnc-server.exe -log            ログを書く(ini の log=1 と同じ)
+ *
+ *  検証用:
+ *  -testsrc [static|video]  画面の代わりに合成した絵を出す(利用者の画面を写さない)。
+ *                      video は全面が毎フレーム変わる(動画のような)絵。
+ *                      入力は再現せずログに書く(-dryrun と同じ)。
+ *  -testframes N       -testsrc の絵を N フレーム動かしたら止める
+ *  -testfps N          -testsrc の 1 秒あたりのフレーム数(既定 60、0 = 求められるだけ)
+ *  -testresize N       -testsrc の N フレーム目で画面を 1280x720 に変える
+ *  -dryrun             入力を再現せずログに書く
+ *  -gdi                DXGI を使わず GDI で取り込む
+ *
+ *  パスワードが無いときは、127.0.0.1 でしか待ち受けない(listen=127.0.0.1 の
+ *  ときだけ動く)。それ以外は設定画面を開いて頼む。
+ * ================================================================== */
+
+#include "iivnc.h"
+#include "resource.h"
+#include <shellapi.h>
+#include <iphlpapi.h>
+#include <stdarg.h>
+
+#define TRAY_CLASS L"iivnc.Server.Tray"
+#define TRAY_ID    1
+
+enum { ID_SETTINGS = 100, ID_DISCONNECT_ALL, ID_EXIT };
+
+HWND  g_mainWnd;
+BOOL  g_dryRun;
+int   g_testSrc;
+int   g_testFrames;
+int   g_testFps = 60;
+int   g_testResize;
+BOOL  g_forceGdi;
+HINSTANCE g_inst;
+
+static NOTIFYICONDATAW g_nid;
+static UINT            g_wmTaskbarCreated;
+static HICON           g_icoIdle, g_icoActive;
+static BOOL            g_listening;
+static WCHAR           g_listenError[160];
+
+/* ------------------------------------------------------------------ */
+/*  通知                                                                */
+/* ------------------------------------------------------------------ */
+
+void app_notify(const WCHAR *fmt, ...)
+{
+    WCHAR  *s = (WCHAR *)malloc(256 * sizeof(WCHAR));
+    va_list ap;
+    if (!s) return;
+    va_start(ap, fmt);
+    _vsnwprintf(s, 255, fmt, ap);
+    va_end(ap);
+    s[255] = 0;
+    if (!g_mainWnd || !PostMessageW(g_mainWnd, WM_APP_NOTIFY, 0, (LPARAM)s)) free(s);
+}
+
+void app_listen_addresses(WCHAR *buf, int cap)
+{
+    ULONG size = 16384;
+    IP_ADAPTER_ADDRESSES *aa = (IP_ADAPTER_ADDRESSES *)malloc(size), *a;
+    int used = 0;
+    buf[0] = 0;
+    if (!aa) return;
+    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size) == ERROR_BUFFER_OVERFLOW) {
+        free(aa);
+        aa = (IP_ADAPTER_ADDRESSES *)malloc(size);
+        if (!aa || GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size)) { free(aa); return; }
+    }
+    for (a = aa; a; a = a->Next) {
+        IP_ADAPTER_UNICAST_ADDRESS *u;
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (u = a->FirstUnicastAddress; u; u = u->Next) {
+            WCHAR ip[64];
+            DWORD n = ARRAYSIZE(ip);
+            int   k;
+            if (WSAAddressToStringW(u->Address.lpSockaddr, (DWORD)u->Address.iSockaddrLength, NULL, ip, &n)) continue;
+            if (!wcsncmp(ip, L"169.254.", 8)) continue;
+            k = _snwprintf(buf + used, (size_t)(cap - used), L"%s%s", used ? L", " : L"", ip);
+            if (k < 0) break;
+            used += k;
+        }
+    }
+    free(aa);
+}
+
+/* ------------------------------------------------------------------ */
+/*  トレイ                                                              */
+/* ------------------------------------------------------------------ */
+
+void app_update_tray(void)
+{
+    int n = (int)g_clientCount;
+    g_nid.uFlags = NIF_ICON | NIF_TIP;
+    g_nid.hIcon = n ? g_icoActive : g_icoIdle;
+    if (!g_listening) _snwprintf(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"iivnc-server - 待ち受けていません");
+    else if (n) _snwprintf(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"iivnc-server - ポート %d、%d 人が接続中", g_cfg.port, n);
+    else _snwprintf(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"iivnc-server - ポート %d で待ち受け中", g_cfg.port);
+    g_nid.szTip[ARRAYSIZE(g_nid.szTip) - 1] = 0;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+static void tray_add(void)
+{
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_mainWnd;
+    g_nid.uID = TRAY_ID;
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.uCallbackMessage = WM_APP_TRAY;
+    g_nid.hIcon = g_icoIdle;
+    lstrcpyW(g_nid.szTip, L"iivnc-server");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    g_nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+    app_update_tray();
+}
+
+static void tray_menu(void)
+{
+    HMENU m = CreatePopupMenu();
+    WCHAR list[2048], *p, *e;
+    POINT pt;
+    int   n = server_list(list, ARRAYSIZE(list));
+
+    AppendMenuW(m, MF_STRING, ID_SETTINGS, L"設定(&S)...");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    if (n) {
+        for (p = list; p && *p; p = e) {
+            e = wcschr(p, L'\n');
+            if (e) *e++ = 0;
+            AppendMenuW(m, MF_STRING | MF_GRAYED, 0, p);
+        }
+        AppendMenuW(m, MF_STRING, ID_DISCONNECT_ALL, L"全員を切断(&D)");
+    } else {
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, g_listening ? L"接続はありません" : L"待ち受けていません");
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, ID_EXIT, L"終了(&X)");
+    SetMenuDefaultItem(m, ID_SETTINGS, FALSE);
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_mainWnd);
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_mainWnd, NULL);
+    PostMessageW(g_mainWnd, WM_NULL, 0, 0);
+    DestroyMenu(m);
+}
+
+/* パスワードが無いのに外から受けようとしていないか */
+static BOOL may_listen(void)
+{
+    if (g_cfg.password[0] || g_cfg.viewPassword[0]) return TRUE;
+    return !lstrcmpW(g_cfg.listen, L"127.0.0.1") || !lstrcmpW(g_cfg.listen, L"::1");
+}
+
+static void start_listening(void)
+{
+    g_listenError[0] = 0;
+    if (!may_listen()) {
+        lstrcpyW(g_listenError, L"パスワードが設定されていないので待ち受けていません。");
+        g_listening = FALSE;
+    } else {
+        g_listening = server_start();
+        if (!g_listening) _snwprintf(g_listenError, ARRAYSIZE(g_listenError), L"ポート %d で待ち受けられません(ほかのソフトが使っていませんか)。", g_cfg.port);
+    }
+    app_update_tray();
+    ui_refresh_status();
+}
+
+const WCHAR *app_listen_error(void) { return g_listenError; }
+BOOL app_listening(void) { return g_listening; }
+
+static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_APP_TRAY:
+        switch (LOWORD(lp)) {
+        case WM_LBUTTONUP:
+        case NIN_SELECT:
+        case NIN_KEYSELECT:
+            ui_show_settings(NULL);
+            break;
+        case WM_CONTEXTMENU:
+        case WM_RBUTTONUP:
+            tray_menu();
+            break;
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_SETTINGS:       ui_show_settings(NULL); break;
+        case ID_DISCONNECT_ALL: server_disconnect_all(); break;
+        case ID_EXIT:           DestroyWindow(hwnd); break;
+        }
+        return 0;
+
+    case WM_APP_COMMAND:
+        if (wp == CMD_EXIT) DestroyWindow(hwnd);
+        else ui_show_settings(NULL);
+        return 0;
+
+    case WM_APP_CLIENTS:
+        app_update_tray();
+        ui_refresh_status();
+        return 0;
+
+    case WM_APP_NOTIFY: {
+        WCHAR *s = (WCHAR *)lp;
+        g_nid.uFlags = NIF_INFO;
+        lstrcpynW(g_nid.szInfo, s, ARRAYSIZE(g_nid.szInfo));
+        lstrcpyW(g_nid.szInfoTitle, L"iivnc-server");
+        g_nid.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+        g_nid.szInfo[0] = 0;
+        free(s);
+        return 0;
+    }
+
+    case WM_APP_RESTART:
+        server_stop();
+        start_listening();
+        return 0;
+
+    case WM_APP_SETCLIP:
+        clip_set_from_remote(hwnd, (WCHAR *)lp);
+        return 0;
+
+    case WM_CLIPBOARDUPDATE:
+        clip_on_update(hwnd);
+        return 0;
+
+    case WM_SETTINGCHANGE:
+        if (lp && !lstrcmpW((const WCHAR *)lp, L"ImmersiveColorSet") && theme_refresh()) ui_theme_changed();
+        return 0;
+
+    case WM_DESTROY:
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        PostQuitMessage(0);
+        return 0;
+    }
+    if (msg == g_wmTaskbarCreated && msg) {     /* エクスプローラが再起動した */
+        tray_add();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* ------------------------------------------------------------------ */
+/*  起動                                                                */
+/* ------------------------------------------------------------------ */
+
+static void mutex_name(WCHAR *out)
+{
+    WCHAR low[MAX_PATH];
+    DWORD h = 2166136261u;
+    int   i;
+    lstrcpynW(low, g_iniPath, MAX_PATH);
+    CharLowerW(low);
+    for (i = 0; low[i]; i++) { h ^= low[i]; h *= 16777619u; }
+    wsprintfW(out, L"Local\\iivnc-server-%08lX", h);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
+{
+    WCHAR   mname[64];
+    HANDLE  mutex;
+    WNDCLASSW wc;
+    MSG     msg;
+    LPWSTR *argv;
+    int     argc, i, cmd = 0;
+    BOOL    openSettings = FALSE, first, logArg = FALSE;
+    INITCOMMONCONTROLSEX icc;
+
+    (void)prev; (void)cmdline; (void)show;
+    g_inst = inst;
+
+    argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (i = 1; argv && i < argc; i++) {
+        const WCHAR *a = argv[i];
+        if (a[0] == L'/') a++;
+        else if (a[0] == L'-') { a++; if (a[0] == L'-') a++; }
+        if (!lstrcmpiW(a, L"ini") && i + 1 < argc) GetFullPathNameW(argv[++i], MAX_PATH, g_iniPath, NULL);
+        else if (!lstrcmpiW(a, L"log")) logArg = TRUE;
+        else if (!lstrcmpiW(a, L"exit")) cmd = CMD_EXIT;
+        else if (!lstrcmpiW(a, L"settings")) openSettings = TRUE;
+        else if (!lstrcmpiW(a, L"dryrun")) g_dryRun = TRUE;
+        else if (!lstrcmpiW(a, L"gdi")) g_forceGdi = TRUE;
+        else if (!lstrcmpiW(a, L"testsrc")) {
+            g_testSrc = 1;
+            g_dryRun = TRUE;
+            if (i + 1 < argc && !lstrcmpiW(argv[i + 1], L"static")) { g_testSrc = 2; i++; }
+            else if (i + 1 < argc && !lstrcmpiW(argv[i + 1], L"video")) { g_testSrc = 3; i++; }
+        }
+        else if (!lstrcmpiW(a, L"testframes") && i + 1 < argc) g_testFrames = _wtoi(argv[++i]);
+        else if (!lstrcmpiW(a, L"testfps") && i + 1 < argc) g_testFps = _wtoi(argv[++i]);
+        else if (!lstrcmpiW(a, L"testresize") && i + 1 < argc) g_testResize = _wtoi(argv[++i]);
+    }
+    if (argv) LocalFree(argv);
+    config_init();
+
+    /* 同じ設定ファイルで動いているものがあれば、そちらに頼んで終わる */
+    mutex_name(mname);
+    mutex = CreateMutexW(NULL, FALSE, mname);
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND other = FindWindowW(TRAY_CLASS, g_iniPath);
+        if (other) {
+            DWORD  pid = 0;
+            HANDLE proc;
+            GetWindowThreadProcessId(other, &pid);
+            AllowSetForegroundWindow(pid);
+            proc = cmd == CMD_EXIT ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+            PostMessageW(other, WM_APP_COMMAND, (WPARAM)cmd, 0);
+            /* -exit は相手が終わるまで待つ(続けて起動し直すスクリプトのため) */
+            if (proc) {
+                WaitForSingleObject(proc, 10000);
+                CloseHandle(proc);
+            }
+        }
+        if (mutex) CloseHandle(mutex);
+        return 0;
+    }
+    if (cmd) {                      /* -exit の相手がいない */
+        if (mutex) CloseHandle(mutex);
+        return 0;
+    }
+
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icc);
+
+    first = GetFileAttributesW(g_iniPath) == INVALID_FILE_ATTRIBUTES;
+    config_load();
+    if (logArg) g_cfg.log = TRUE;
+    log_open();
+    theme_init();
+    if (first) config_save();
+    log_printf(L"iivnc-server %s 起動 (設定 %s)%s%s", APP_VERSION, g_iniPath,
+               g_testSrc ? L" 検証用の絵" : L"", g_dryRun ? L" 入力はログだけ" : L"");
+
+    g_icoIdle   = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    g_icoActive = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_ACTIVE), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+
+    g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = main_proc;
+    wc.hInstance = inst;
+    wc.lpszClassName = TRAY_CLASS;
+    RegisterClassW(&wc);
+    /* 別のインスタンスが探せるよう、タイトルに設定ファイルのパスを入れておく */
+    g_mainWnd = CreateWindowExW(WS_EX_TOOLWINDOW, TRAY_CLASS, g_iniPath, WS_POPUP, 0, 0, 0, 0, NULL, NULL, inst, NULL);
+    if (!g_mainWnd) return 1;
+    ChangeWindowMessageFilterEx(g_mainWnd, g_wmTaskbarCreated, MSGFLT_ALLOW, NULL);
+    ChangeWindowMessageFilterEx(g_mainWnd, WM_APP_COMMAND, MSGFLT_ALLOW, NULL);
+    theme_allow_dark(g_mainWnd);
+    tray_add();
+
+    pool_init();
+    capture_init();
+    clip_init(g_mainWnd);
+    start_listening();
+    if (!g_listening && !may_listen()) openSettings = TRUE;
+    if (openSettings) ui_show_settings(NULL);
+
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (ui_dialog_message(&msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    server_stop();
+    capture_shutdown();
+    log_printf(L"iivnc-server 終了");
+    if (mutex) CloseHandle(mutex);
+    return 0;
+}
