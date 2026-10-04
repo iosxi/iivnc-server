@@ -10,6 +10,10 @@
  *  サービスとして動いているときは、トレイから管理者として開かれる
  *  (-svcsettings、g_uiService)。状態は分身の共有メモリから読み、OK で ini に
  *  書いて分身に読み直させる。「サービスとして登録」「サービスをやめる」もここ。
+ *
+ *  「ネットワークの許可」: 初めて待ち受けたときに Windows が作った、この exe の
+ *  ファイアウォールの規則を数え、「許可を消す」で消す(管理者で。fwrules.c)。
+ *  サービスとして登録しているときは、サービス用の規則(FW_RULE)は数えず、消さない。
  * ================================================================== */
 
 #include "iivnc.h"
@@ -22,6 +26,8 @@ static HWND  g_dlg;
 static HFONT g_heading;
 static int   g_footerTop;
 static int   g_ndisplays;
+
+static void fw_refresh(HWND dlg, const WCHAR *done);
 
 BOOL ui_settings_open(void) { return g_dlg != NULL; }
 
@@ -164,6 +170,35 @@ static void fill(HWND dlg)
         wsprintfW(s, L"設定: %s", g_iniPath);
         SetDlgItemTextW(dlg, IDC_INIPATH, s);
     }
+    fw_refresh(dlg, NULL);
+}
+
+/* サービスとして登録しているなら、サービス用の規則は残す(ログイン前の接続に要る) */
+static const WCHAR *fw_keep(void)
+{
+    return (g_uiService || svc_installed()) ? FW_RULE : NULL;
+}
+
+/* 「ネットワークの許可」の欄を書き直す。done があれば、それを出す */
+static void fw_refresh(HWND dlg, const WCHAR *done)
+{
+    FwInfo fi;
+    WCHAR  s[300];
+    if (!fw_query(fw_keep(), &fi)) lstrcpyW(s, L"Windows ファイアウォールの設定を読めませんでした。");
+    else fw_describe(&fi, s, ARRAYSIZE(s));
+    SetDlgItemTextW(dlg, IDC_FWTEXT, done ? done : s);
+    EnableWindow(GetDlgItem(dlg, IDC_FWREMOVE), fi.count > 0);
+}
+
+static void remove_firewall(HWND dlg)
+{
+    WCHAR args[MAX_PATH + 40], s[200];
+    int   n;
+    swprintf(args, ARRAYSIZE(args), L"-remove-firewall -ini \"%s\"", g_iniPath);
+    n = fw_remove_elevated(dlg, fw_keep(), args);
+    if (n < 0) lstrcpyW(s, L"消せませんでした(管理者の確認を断ったか、失敗しました)。");
+    else swprintf(s, ARRAYSIZE(s), L"%d 件消しました。次に待ち受けを始めるとき、Windows がもう一度たずねます。", n);
+    fw_refresh(dlg, s);
 }
 
 static int message(HWND owner, const WCHAR *main, const WCHAR *content)
@@ -334,7 +369,7 @@ static INT_PTR CALLBACK dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         LOGFONTW lf;
         HFONT    base = (HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0);
         RECT     r, pad = { 0, 0, 0, 7 };
-        static const int heads[] = { IDC_H_STATUS, IDC_H_CLIENTS, IDC_H_CONN, IDC_H_SERVICE };
+        static const int heads[] = { IDC_H_STATUS, IDC_H_CLIENTS, IDC_H_CONN, IDC_H_SERVICE, IDC_H_FW };
         int i;
         HICON ic = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
         HICON ib = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
@@ -345,7 +380,7 @@ static INT_PTR CALLBACK dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
             lf.lfHeight = MulDiv(lf.lfHeight, 118, 100);
             g_heading = CreateFontIndirectW(&lf);
         }
-        for (i = 0; i < 4; i++) if (g_heading) SendDlgItemMessageW(dlg, heads[i], WM_SETFONT, (WPARAM)g_heading, TRUE);
+        for (i = 0; i < (int)ARRAYSIZE(heads); i++) if (g_heading) SendDlgItemMessageW(dlg, heads[i], WM_SETFONT, (WPARAM)g_heading, TRUE);
         GetWindowRect(GetDlgItem(dlg, IDOK), &r);
         MapWindowPoints(NULL, dlg, (POINT *)&r, 2);
         MapDialogRect(dlg, &pad);
@@ -415,6 +450,9 @@ static INT_PTR CALLBACK dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_SERVICE:
             if (g_uiService) uninstall_service(dlg);
             else install_service(dlg);
+            return TRUE;
+        case IDC_FWREMOVE:
+            remove_firewall(dlg);
             return TRUE;
         case IDOK:
             if (apply(dlg)) DestroyWindow(dlg);

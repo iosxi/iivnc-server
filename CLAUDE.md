@@ -23,6 +23,7 @@
 `src/zlite.h` `src/zdeflate.c` `src/zinflate.c` `src/vncdes.c` `src/vncdes.h` `src/theme.c`(theme.c は
 先頭の `#include` だけ違う)は `../iivnc-client/src` と中身をそろえる。片方を直したらもう片方へ写し、
 `diff` で確かめる。`theme.c` は kotemado のものを持ってきた。
+`src/fwrules.c`(ファイアウォールの、この exe の規則を数える・消す)も同じく先頭の `#include` だけ違う。
 
 ## 動作確認について
 
@@ -111,6 +112,25 @@ TokenSessionId を書き換え)で起動し、ログインしたユーザーに�
   資格情報の画面から Winlogon デスクトップになる。
 - 登録前の SoftwareSASGeneration は無かった。登録で 1、解除で値ごと消えて元どおり。ファイアウォールの規則も消える。
 - 解除すると、トレイ(ユーザーの権限)が 3 秒以内に気づき、ふだんのトレイ常駐で起動し直す。
+
+### ネットワークの許可(fwrules.c、2026-10-04)
+
+- Windows が確認の画面で作る規則は、レジストリ上の名前が `TCP Query User{GUID}<exe のパス>` だが、
+  **COM(INetFwRule)から見える Name は表示名(FileDescription)** で、TCP と UDP、別の場所の同じ exe の規則とも同じ。
+  `INetFwRules::Remove` は名前で消すので、**消す規則だけを一意な名前に付け替えてから消す**
+  (仮の規則で実測: 同じ名前の A・B のうち A だけを付け替えて消し、B が残った)。
+- 読むのは一般の権限で読めた(COM の Rules を列挙)。消すのは管理者が要るので、自分を `-remove-firewall` で
+  管理者として起動し、終了コード(消した数、-1 = 失敗)を受け取る。
+- `python ../iivnc-server/tools/fwcheck.py [exe]`: exe を `build/fwtest/` に写し、その写しの仮の規則
+  (Windows と同じ表示名、無効にしたもの)を管理者の PowerShell で作り、画面のボタンを押して、写しの規則が 0 件、
+  本物の規則の数が変わらないことを見る(利用者の本物の規則には触れない)。
+- 2026-10-04 にこの PC のレジストリを `iivnc` で検索: サーバーの確認画面の規則 2 件(パブリックで許可)、
+  通知領域のアイコンの記録(`NotifyIconSettings`、`NotifyIconGeneratedAumid_<番号>` の通知設定など)、
+  Windows がアプリすべてに付ける記録(MuiCache、FeatureUsage、互換性アシスタント)。サービスの登録・
+  `SoftwareSASGeneration` は残っていなかった(サービスをやめたとき戻っている)。
+
+- **利用者が動かしている iivnc-server が exe を使っていると上書きできない**(管理者で動いているので止めにくい)。
+  動いている exe は名前を変えられるので、`build/` へ移してから組む(動いているものはそのまま動き続ける)。
 
 ### 確かめていないこと
 

@@ -24,3 +24,6 @@
 #define IDC_H_SERVICE    1018
 #define IDC_SVCTEXT      1019
 #define IDC_SERVICE      1020
+#define IDC_H_FW         1021
+#define IDC_FWTEXT       1022
+#define IDC_FWREMOVE     1023

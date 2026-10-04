@@ -14,6 +14,8 @@
  *  -agent              分身(サービスがコンソールのセッションへ SYSTEM で起動する)
  *  -tray               ログインしたユーザーのトレイ(サービスが起動する)
  *  -svcsettings        管理者で: サービスの設定画面
+ *  -remove-firewall    管理者で: ファイアウォールの、この exe の規則を消す(設定画面のボタンから呼ぶ。
+ *                      終了コードは消した数、-1 = 失敗。サービスとして登録していれば、その規則は残す)
  *  サービスとして登録されているときに、同じ ini でふつうに起動すると -tray になる。
  *
  *  検証用:
@@ -317,7 +319,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     LPWSTR *argv;
     int     argc, i, cmd = 0;
     BOOL    openSettings = FALSE, first, logArg = FALSE;
-    int     svcMode = 0;            /* 1 = -service、2 = -agent、3 = -tray、4 = -svcsettings、5 = -install-service、6 = -uninstall-service */
+    int     svcMode = 0;            /* 1 = -service、2 = -agent、3 = -tray、4 = -svcsettings、5 = -install-service、6 = -uninstall-service、7 = -remove-firewall */
     INITCOMMONCONTROLSEX icc;
 
     (void)prev; (void)cmdline; (void)show;
@@ -340,6 +342,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         else if (!lstrcmpiW(a, L"svcsettings")) svcMode = 4;
         else if (!lstrcmpiW(a, L"install-service")) svcMode = 5;
         else if (!lstrcmpiW(a, L"uninstall-service")) svcMode = 6;
+        else if (!lstrcmpiW(a, L"remove-firewall")) svcMode = 7;
         else if (!lstrcmpiW(a, L"testsrc")) {
             g_testSrc = 1;
             g_dryRun = TRUE;
@@ -388,6 +391,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         if (logArg) g_cfg.log = TRUE;
         log_open();
         return svc_uninstall(NULL) ? 0 : 2;
+    case 7:                             /* ファイアウォールの規則を消す(管理者) */
+        config_load();
+        if (logArg) g_cfg.log = TRUE;
+        log_open();
+        return fw_remove(svc_installed() ? FW_RULE : NULL);
     case 2:
         g_runMode = RUN_AGENT;
         break;

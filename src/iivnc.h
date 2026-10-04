@@ -34,8 +34,8 @@
 #include "zlite.h"
 
 #define APP_NAME     L"iivnc-server"
-#define APP_VERSION  L"1.1.0"
-#define APP_VERSION_A "1.1.0"
+#define APP_VERSION  L"1.2.0"
+#define APP_VERSION_A "1.2.0"
 
 #define WM_APP_TRAY     (WM_APP + 1)
 #define WM_APP_COMMAND  (WM_APP + 2)    /* 別のプロセスから(-exit など) */
@@ -364,6 +364,14 @@ BOOL svc_read_status(SvcStatus *st);
 void svc_signal_disconnect(void);
 void svc_signal_reload(void);
 void svc_firewall(BOOL add);
+#define FW_RULE L"iivnc-server (VNC)"       /* サービスのときに足す規則の名前 */
+
+/* fwrules.c: Windows ファイアウォールの、この exe の規則(iivnc-client と同じファイル) */
+typedef struct { int count, allow, block; long allowProfiles, blockProfiles; } FwInfo;
+BOOL fw_query(const WCHAR *keep, FwInfo *fi);                   /* keep: 数えない規則の名前(NULL 可) */
+int  fw_remove(const WCHAR *keep);                              /* 管理者で。消した数、-1 = 失敗 */
+int  fw_remove_elevated(HWND owner, const WCHAR *keep, const WCHAR *args);
+void fw_describe(const FwInfo *fi, WCHAR *s, int cap);
 BOOL agent_init(void);
 void agent_status_update(void);
 void agent_notify(const WCHAR *s);

@@ -44,7 +44,6 @@
 
 #define SVC_NAME        L"iivnc-server"
 #define SVC_DISPLAY     L"iivnc-server (VNC サーバー)"
-#define FW_RULE         L"iivnc-server (VNC)"
 #define OBJ_STATUS      L"Global\\iivnc-server-status"
 #define OBJ_AGENT_STOP  L"Global\\iivnc-server-agent-stop"
 #define OBJ_SAS         L"Global\\iivnc-server-sas"
