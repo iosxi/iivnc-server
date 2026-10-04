@@ -25,6 +25,7 @@
  *  -testframes N       -testsrc の絵を N フレーム動かしたら止める
  *  -testfps N          -testsrc の 1 秒あたりのフレーム数(既定 60、0 = 求められるだけ)
  *  -testresize N       -testsrc の N フレーム目で画面を 1280x720 に変える
+ *  -testcursor hidden|none  -testsrc のカーソルを隠れた状態にする(none は形も無し)
  *  -dryrun             入力を再現せずログに書く
  *  -gdi                DXGI を使わず GDI で取り込む
  *
@@ -50,6 +51,7 @@ int   g_testSrc;
 int   g_testFrames;
 int   g_testFps = 60;
 int   g_testResize;
+int   g_testCursor;
 BOOL  g_forceGdi;
 HINSTANCE g_inst;
 
@@ -352,6 +354,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         else if (!lstrcmpiW(a, L"testframes") && i + 1 < argc) g_testFrames = _wtoi(argv[++i]);
         else if (!lstrcmpiW(a, L"testfps") && i + 1 < argc) g_testFps = _wtoi(argv[++i]);
         else if (!lstrcmpiW(a, L"testresize") && i + 1 < argc) g_testResize = _wtoi(argv[++i]);
+        else if (!lstrcmpiW(a, L"testcursor") && i + 1 < argc) g_testCursor = !lstrcmpiW(argv[++i], L"none") ? 2 : 1;
     }
     if (argv) LocalFree(argv);
     config_init();

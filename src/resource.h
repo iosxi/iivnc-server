@@ -27,3 +27,4 @@
 #define IDC_H_FW         1021
 #define IDC_FWTEXT       1022
 #define IDC_FWREMOVE     1023
+#define IDC_SHOWCURSOR   1024

@@ -321,15 +321,76 @@ static void set_cursor_shape(int w, int h, int hx, int hy, const BYTE *pix, cons
 
 static void set_cursor_pos(int x, int y, BOOL visible)
 {
+    BOOL changed = FALSE;
     AcquireSRWLockExclusive(&g_scr.lock);
     if (x != g_scr.curX || y != g_scr.curY || visible != g_scr.curVisible) {
         g_scr.curX = x;
         g_scr.curY = y;
-        if (visible != g_scr.curVisible) g_scr.curVer++;    /* 見え方が変わった = 形を送り直す */
+        if (visible != g_scr.curVisible) { g_scr.curVer++; changed = TRUE; }   /* 見え方が変わった = 形を送り直す */
         g_scr.curVisible = visible;
         g_scr.curPosVer++;
     }
     ReleaseSRWLockExclusive(&g_scr.lock);
+    if (changed) log_printf(L"カーソル: Windows が%s", visible ? L"表示している" : L"隠している");
+}
+
+static void cursor_from_hcursor(HCURSOR hc);
+
+/* 形がまだ一つも無ければ、標準の矢印にする */
+static void cursor_ensure_shape(void)
+{
+    BOOL none;
+    AcquireSRWLockShared(&g_scr.lock);
+    none = g_scr.curPix == NULL;
+    ReleaseSRWLockShared(&g_scr.lock);
+    if (none) {
+        cursor_from_hcursor(LoadCursorW(NULL, IDC_ARROW));
+        log_printf(L"カーソル: 形が無いので標準の矢印を使う");
+    }
+}
+
+/* Windows 10 はマウスがつながっていないとカーソルを隠したままにする(見えるのは
+   マウスを挿したときだけ)。隠れている間も Windows が持っている形(矢印・I ビームなど)を
+   追い、相手には見せる(showcursor=1)。隠れているので DXGI は形を渡してこない */
+static void cursor_follow_hidden(void)
+{
+    CURSORINFO ci;
+    if (!g_cfg.showCursor) return;
+    ci.cbSize = sizeof(ci);
+    if (GetCursorInfo(&ci) && ci.hCursor && ci.hCursor != g_lastCursor) {
+        g_lastCursor = ci.hCursor;
+        cursor_from_hcursor(ci.hCursor);
+    }
+    cursor_ensure_shape();
+}
+
+/* マウスの有無を記録に書く(マウスが無い PC でカーソルが見えないときの手がかり) */
+static void log_mouse_devices(void)
+{
+    static BOOL done;
+    RAWINPUTDEVICELIST *l;
+    UINT n = 0, i, mice = 0;
+    CURSORINFO ci;
+    if (done) return;
+    done = TRUE;
+    GetRawInputDeviceList(NULL, &n, sizeof(RAWINPUTDEVICELIST));
+    l = (RAWINPUTDEVICELIST *)calloc(n ? n : 1, sizeof(*l));
+    if (l && (int)GetRawInputDeviceList(l, &n, sizeof(*l)) >= 0) {
+        for (i = 0; i < n; i++) {
+            WCHAR name[256];
+            UINT  len = ARRAYSIZE(name);
+            if (l[i].dwType != RIM_TYPEMOUSE) continue;
+            mice++;
+            name[0] = 0;
+            GetRawInputDeviceInfoW(l[i].hDevice, RIDI_DEVICENAME, name, &len);
+            log_printf(L"マウスの装置: %s", name);
+        }
+    }
+    free(l);
+    ci.cbSize = sizeof(ci);
+    GetCursorInfo(&ci);
+    log_printf(L"マウス: SM_MOUSEPRESENT %d、装置 %u 個。カーソルの flags %lu、形 %p", GetSystemMetrics(SM_MOUSEPRESENT), mice,
+               (unsigned long)ci.flags, (void *)ci.hCursor);
 }
 
 /* DXGI の形を BGRA と見える印に直す */
@@ -496,6 +557,7 @@ static void gdi_seed(void)
         BOOL vis = (ci.flags & CURSOR_SHOWING) != 0;
         if (vis && ci.hCursor) cursor_from_hcursor(ci.hCursor);
         set_cursor_pos(ci.ptScreenPos.x - g_scr.vx, ci.ptScreenPos.y - g_scr.vy, vis);
+        if (!vis) cursor_follow_hidden();
     }
 }
 
@@ -590,6 +652,7 @@ static BOOL dxgi_open(void)
         g_dups[i].ox = g_dups[i].desk.left - bound.left;
         g_dups[i].oy = g_dups[i].desk.top - bound.top;
     }
+    log_mouse_devices();
     gdi_seed();
     log_printf(L"DXGI で取り込む(出力 %d 個)。最初の絵は GDI で撮った", g_ndup);
     return TRUE;
@@ -649,9 +712,11 @@ static int dxgi_grab(DWORD timeout)
             UINT need = 0;
             if (SUCCEEDED(IDXGIOutputDuplication_GetFramePointerShape(d->dup, g_shapeCap, g_shape, &need, &si))) {
                 cursor_from_dxgi(&si, g_shape);
+                g_lastCursor = NULL;            /* 隠れたら、また GetCursorInfo の形から追い直す */
                 result = 1;
             }
         }
+        if (!g_scr.curVisible) cursor_follow_hidden();
 
         if (fi.LastPresentTime.QuadPart && res && ensure_staging(d)) {
             ID3D11Texture2D *tex = NULL;
@@ -744,6 +809,7 @@ static BOOL gdi_open(void)
     ReleaseDC(NULL, dc);
     if (!g_dib) { DeleteDC(g_memDC); g_memDC = NULL; return FALSE; }
     g_oldBmp = (HBITMAP)SelectObject(g_memDC, g_dib);
+    log_mouse_devices();
     log_printf(L"GDI で取り込む");
     return TRUE;
 }
@@ -772,6 +838,7 @@ static int gdi_grab(void)
             cursor_from_hcursor(ci.hCursor);
         }
         set_cursor_pos(ci.ptScreenPos.x - g_scr.vx, ci.ptScreenPos.y - g_scr.vy, vis);
+        if (!vis) cursor_follow_hidden();
     }
     return 1;
 }
@@ -902,8 +969,9 @@ static BOOL test_open(void)
             mask[i * 2 + x / 8] |= (BYTE)(0x80 >> (x & 7));
         }
     }
-    set_cursor_shape(12, 19, 0, 0, cur, mask);
-    set_cursor_pos(960, 540, TRUE);
+    if (g_testCursor != 2) set_cursor_shape(12, 19, 0, 0, cur, mask);
+    set_cursor_pos(960, 540, !g_testCursor);
+    if (g_testCursor && g_cfg.showCursor) cursor_ensure_shape();   /* 検証用: 隠れたカーソル(none は形も無し) */
     free(cur);
     free(mask);
     return TRUE;

@@ -178,8 +178,10 @@ class Client:
             elif e == 7:
                 self.do_tight(x, y, w, h)
             elif e == -239:
-                self.read(w * h * self.bpp + (w + 7) // 8 * h)
+                self.read(w * h * self.bpp)
+                mask = self.read((w + 7) // 8 * h)
                 self.cursor = (w, h, x, y)
+                self.cursor_bits = sum(bin(b).count('1') for b in mask)   # 見える画素の数
             elif e == -232:
                 self.pointer = (x, y)
             elif e == -258:

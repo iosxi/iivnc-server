@@ -800,7 +800,7 @@ static DWORD WINAPI writer_thread(void *arg)
         if (wantRich && c->cursorVer != g_scr.curVer && g_scr.curPix) {
             sendCursor = TRUE;
             c->cursorVer = g_scr.curVer;
-            cvis = g_scr.curVisible;
+            cvis = g_scr.curVisible || g_cfg.showCursor;      /* 隠れていても見せる(マウスが無い PC 向け) */
             cw = g_scr.curW; chh = g_scr.curH; chx = g_scr.curHotX; chy = g_scr.curHotY;
             curPix = (BYTE *)malloc((size_t)cw * chh * 4);
             curMask = (BYTE *)malloc((size_t)((cw + 7) / 8) * chh);

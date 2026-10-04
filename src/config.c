@@ -34,6 +34,7 @@ void config_init(void)
     ZeroMemory(&g_cfg, sizeof(g_cfg));
     g_cfg.port   = 5900;
     g_cfg.notify = 1;
+    g_cfg.showCursor = 1;
     g_cfg.sasBefore = -2;
 }
 
@@ -134,6 +135,7 @@ void config_load(void)
         else if (!_stricmp(key, "viewonly")) g_cfg.viewOnly = atoi(val) != 0;
         else if (!_stricmp(key, "display")) g_cfg.display = atoi(val);
         else if (!_stricmp(key, "notify")) g_cfg.notify = atoi(val) != 0;
+        else if (!_stricmp(key, "showcursor")) g_cfg.showCursor = atoi(val) != 0;
         else if (!_stricmp(key, "maxfps")) g_cfg.maxFps = atoi(val);
         else if (!_stricmp(key, "theme")) g_cfg.theme = !_stricmp(val, "light") ? 1 : !_stricmp(val, "dark") ? 2 : 0;
         else if (!_stricmp(key, "log")) g_cfg.log = atoi(val) != 0;
@@ -179,6 +181,8 @@ BOOL config_save(void)
         "display=%d\n"
         "; 1 = 接続・切断を通知で知らせる\n"
         "notify=%d\n"
+        "; 1 = Windows がカーソルを隠していても(マウスが無い PC など)、相手にカーソルを見せる\n"
+        "showcursor=%d\n"
         "; 1 秒あたりの更新の上限。0 = 制限しない\n"
         "maxfps=%d\n"
         "\n[general]\n"
@@ -189,7 +193,7 @@ BOOL config_save(void)
         "\n[service]\n"
         "; サービスとして登録する前の SoftwareSASGeneration(解除のときに戻す。-1 = 無かった、-2 = 控えていない)\n"
         "sas_before=%d\n",
-        g_cfg.port, listen ? listen : "", pw, vpw, g_cfg.viewOnly, g_cfg.display, g_cfg.notify, g_cfg.maxFps,
+        g_cfg.port, listen ? listen : "", pw, vpw, g_cfg.viewOnly, g_cfg.display, g_cfg.notify, g_cfg.showCursor, g_cfg.maxFps,
         g_cfg.theme == 1 ? "light" : g_cfg.theme == 2 ? "dark" : "system", g_cfg.log, g_cfg.sasBefore);
     free(listen);
     if (n < 0) return FALSE;

@@ -113,6 +113,22 @@ TokenSessionId を書き換え)で起動し、ログインしたユーザーに�
 - 登録前の SoftwareSASGeneration は無かった。登録で 1、解除で値ごと消えて元どおり。ファイアウォールの規則も消える。
 - 解除すると、トレイ(ユーザーの権限)が 3 秒以内に気づき、ふだんのトレイ常駐で起動し直す。
 
+### マウスが無い PC でカーソルが見えない、という報告(2026-10-04、v4)
+
+利用者の報告: Windows 10 のマウスをつないでいない PC をサーバーにすると、ビューアでカーソルが見えない。
+
+- Windows はマウスが無いとカーソルを隠す(`GetCursorInfo` に `CURSOR_SHOWING` が無い、DXGI の
+  `PointerPosition.Visible` が FALSE、DXGI は形を渡さない)。サーバーはそれをそのまま「透明なカーソル」として
+  送っていた(`-testcursor hidden` + `showcursor=0` で 1×1・見える画素 0 が届くのを確認 = 前の版と同じ形)。
+  クライアントは透明な形を受けるとカーソルを消す(形を一度も受けていなければ点を出す)。
+- 対策 `showcursor=1`(既定): 隠れていても見えるものとして送る。形は `GetCursorInfo` の hCursor から追い、
+  無ければ標準の矢印(`cursor_follow_hidden`、`cursor_ensure_shape`)。DXGI の形が来たら `g_lastCursor` を戻す。
+- `python tools/cursorcheck.py`: 見える / 隠れている(形あり)/ 隠れている(形なし)× showcursor 0・1 の 6 通り。
+- `log=1` で、起動時にマウスの装置の一覧・`SM_MOUSEPRESENT`・カーソルの flags を、見え方が変わるたびに
+  「カーソル: Windows が隠している」を書く。この PC(マウスあり)では装置 6 個、flags 1。
+- **マウスが無い PC での実測はしていない**(この PC のマウスを外せない)。隠れている間に `GetCursorInfo` が
+  形を返すか、DXGI の取り込みが続くかは、利用者の Windows 10 の記録で確かめる。
+
 ### ネットワークの許可(fwrules.c、2026-10-04)
 
 - Windows が確認の画面で作る規則は、レジストリ上の名前が `TCP Query User{GUID}<exe のパス>` だが、

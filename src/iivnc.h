@@ -34,8 +34,8 @@
 #include "zlite.h"
 
 #define APP_NAME     L"iivnc-server"
-#define APP_VERSION  L"1.2.0"
-#define APP_VERSION_A "1.2.0"
+#define APP_VERSION  L"1.3.0"
+#define APP_VERSION_A "1.3.0"
 
 #define WM_APP_TRAY     (WM_APP + 1)
 #define WM_APP_COMMAND  (WM_APP + 2)    /* 別のプロセスから(-exit など) */
@@ -60,11 +60,12 @@ typedef struct Config {
     int   viewOnly;             /* 1 = 誰にも操作させない */
     int   display;              /* 0 = すべての画面、n = \\.\DISPLAYn だけ */
     int   notify;               /* 1 = 接続・切断を通知で知らせる */
+    int   showCursor;           /* 1 = Windows がカーソルを隠していても(マウスが無い PC など)相手に見せる */
     int   theme;                /* 0 = システム、1 = ライト、2 = ダーク */
     int   log;
     int   maxFps;               /* 0 = 制限しない */
-    int   sasBefore;
-    int   selftest;             /* 検証用: 分身が起動 20 秒後に入力デスクトップを撮ってログに書く */            /* サービス登録の前の SoftwareSASGeneration(-1 = 無かった、-2 = 控えていない) */
+    int   sasBefore;            /* サービス登録の前の SoftwareSASGeneration(-1 = 無かった、-2 = 控えていない) */
+    int   selftest;             /* 検証用: 分身が起動 20 秒後に入力デスクトップを撮ってログに書く */
 } Config;
 
 extern Config g_cfg;
@@ -77,6 +78,7 @@ extern int    g_testSrc;        /* -testsrc: 画面の代わりに検証用の�
 extern int    g_testFrames;     /* -testsrc で動かすフレーム数(0 = ずっと) */
 extern int    g_testFps;
 extern int    g_testResize;
+extern int    g_testCursor;         /* -testcursor: 1 = hidden(形はあるが隠れている)、2 = none(形も無く隠れている) */
 extern BOOL   g_forceGdi;       /* -gdi: DXGI を使わず GDI で取り込む(検証用) */     /* -testresize N: N フレーム目で 1280x720 に変える */        /* -testsrc の 1 秒あたりのフレーム数(0 = 求められるだけ) */
 
 void config_init(void);
