@@ -776,6 +776,7 @@ BOOL svc_uninstall(HWND owner)
 #define TRAYS_CLASS L"iivnc.Server.SvcTray"
 #define TIMER_POLL  1
 #define TIMER_SVC   2
+static BOOL g_tV4;              /* 新しい形式(NOTIFYICON_VERSION_4)にできた */
 
 enum { IDT_SETTINGS = 200, IDT_DISCONNECT, IDT_HIDE };
 
@@ -801,7 +802,7 @@ static void tray_refresh(HWND hwnd)
     else swprintf(g_tn.szTip, ARRAYSIZE(g_tn.szTip), L"iivnc-server(サービス)- ポート %ld で待ち受け中", st.port);
     if (!g_tAdded) {
         g_tAdded = Shell_NotifyIconW(NIM_ADD, &g_tn);
-        if (g_tAdded) { g_tn.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &g_tn); }
+        if (g_tAdded) { g_tn.uVersion = NOTIFYICON_VERSION_4; g_tV4 = Shell_NotifyIconW(NIM_SETVERSION, &g_tn); }
     } else {
         Shell_NotifyIconW(NIM_MODIFY, &g_tn);
     }
@@ -873,11 +874,19 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_APP_TRAY:
         switch (LOWORD(lp)) {
-        case WM_LBUTTONUP: case NIN_SELECT: case NIN_KEYSELECT:
+        /* 新しい形式では、左クリック 1 回で WM_LBUTTONUP と NIN_SELECT の両方が来る
+           (右クリックは WM_RBUTTONUP と WM_CONTEXTMENU)。両方で開くと設定画面が 2 枚になる */
+        case NIN_SELECT: case NIN_KEYSELECT:
             svc_run_elevated(L"-svcsettings", NULL, FALSE, NULL);
             break;
-        case WM_CONTEXTMENU: case WM_RBUTTONUP:
+        case WM_LBUTTONUP:
+            if (!g_tV4) svc_run_elevated(L"-svcsettings", NULL, FALSE, NULL);
+            break;
+        case WM_CONTEXTMENU:
             tray_menu2(hwnd);
+            break;
+        case WM_RBUTTONUP:
+            if (!g_tV4) tray_menu2(hwnd);
             break;
         }
         return 0;

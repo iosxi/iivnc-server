@@ -129,6 +129,8 @@ void app_update_tray(void)
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
+static BOOL g_trayV4;           /* 新しい形式(NOTIFYICON_VERSION_4)にできた */
+
 static void tray_add(void)
 {
     ZeroMemory(&g_nid, sizeof(g_nid));
@@ -141,7 +143,7 @@ static void tray_add(void)
     lstrcpyW(g_nid.szTip, L"iivnc-server");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+    g_trayV4 = Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
     app_update_tray();
 }
 
@@ -203,13 +205,19 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_APP_TRAY:
         switch (LOWORD(lp)) {
+        /* 新しい形式では、左クリックで WM_LBUTTONUP と NIN_SELECT、右クリックで WM_RBUTTONUP と
+           WM_CONTEXTMENU の両方が来る。片方だけで動く */
         case WM_LBUTTONUP:
+            if (g_trayV4) break;
+            /* fall through */
         case NIN_SELECT:
         case NIN_KEYSELECT:
             ui_show_settings(NULL);
             break;
-        case WM_CONTEXTMENU:
         case WM_RBUTTONUP:
+            if (g_trayV4) break;
+            /* fall through */
+        case WM_CONTEXTMENU:
             tray_menu();
             break;
         }
@@ -372,6 +380,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     case 3:                             /* トレイ */
         return svc_tray_main(cmd);
     case 4: {                           /* サービスの設定画面(管理者) */
+        /* すでに開いていれば、それを手前に出して終わる(アイコンを続けて押したときなど) */
+        HANDLE one = CreateMutexW(NULL, FALSE, L"Local\\iivnc-server-svcsettings");
+        if (one && GetLastError() == ERROR_ALREADY_EXISTS) {
+            HWND other = FindWindowW(L"#32770", L"iivnc-server");
+            if (other) {
+                if (IsIconic(other)) ShowWindow(other, SW_RESTORE);
+                SetForegroundWindow(other);
+            }
+            return 0;
+        }
         config_load();
         log_open();
         theme_init();
