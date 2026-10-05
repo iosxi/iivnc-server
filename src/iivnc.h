@@ -35,8 +35,8 @@
 #include "zlite.h"
 
 #define APP_NAME     L"iivnc-server"
-#define APP_VERSION  L"1.5.0"
-#define APP_VERSION_A "1.5.0"
+#define APP_VERSION  L"1.6.0"
+#define APP_VERSION_A "1.6.0"
 
 #define WM_APP_TRAY     (WM_APP + 1)
 #define WM_APP_COMMAND  (WM_APP + 2)    /* 別のプロセスから(-exit など) */
@@ -67,6 +67,7 @@ typedef struct Config {
     int   display;              /* 0 = すべての画面、n = \\.\DISPLAYn だけ */
     int   notify;               /* 1 = 接続・切断を通知で知らせる */
     int   showCursor;           /* 1 = Windows がカーソルを隠していても(マウスが無い PC など)相手に見せる */
+    int   noSleep;              /* 1 = 接続されている間はスリープさせず、画面も消さない */
     int   fxOffer;              /* 検証用(ini の fxoffer=1。保存しない): 相手がつながったら、今クリップボードにあるファイルを渡す */
     int   theme;                /* 0 = システム、1 = ライト、2 = ダーク */
     int   log;
@@ -212,6 +213,7 @@ void server_disconnect_all(void);
 void server_disconnect(int id);
 int  server_list(WCHAR *buf, int cap);      /* 「アドレス」を改行で並べる。戻り値は数 */
 void server_clipboard_changed(const char *utf8, int len);
+void power_update(void);                        /* main.c: 接続の数と設定に合わせてスリープを止める・解く */
 void server_files_changed(HDROP hd);            /* クリップボードにファイルがコピーされた(メインのスレッド) */
 void server_files_changed_paths(const WCHAR *paths);    /* 同じく、パスの一覧で(サービスのトレイから) */
 void clip_text_from_tray(const WCHAR *text);    /* 分身: サービスのトレイが読んだ利用者の文字 */

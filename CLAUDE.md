@@ -114,6 +114,19 @@ TokenSessionId を書き換え)で起動し、ログインしたユーザーに�
 - 登録前の SoftwareSASGeneration は無かった。登録で 1、解除で値ごと消えて元どおり。ファイアウォールの規則も消える。
 - 解除すると、トレイ(ユーザーの権限)が 3 秒以内に気づき、ふだんのトレイ常駐で起動し直す。
 
+### スリープさせない(2026-10-05、server v7 / client v9)
+
+利用者の要望: つないでいる間はスリープさせない。決めたこと: サーバー(接続されている間)とクライアント(つないでいる間)の
+両方、画面の消灯も止める、既定オン(server `nosleep=1`、client `nosleep=1`)。
+
+- `PowerCreateRequest`(理由の文字列つき)+ `PowerSetRequest(SystemRequired と DisplayRequired)`。
+  サーバーは `WM_APP_CLIENTS`(接続の数が変わった)と設定の変更・分身の読み直しで `power_update()`、
+  クライアントはつないだとき(`on_connected`)に止め、切れたとき(`WM_APP_CLOSED`)に解く。プロセスが終われば Windows が解く。
+- `python ../iivnc-server/tools/nosleepcheck.py`: 管理者の `powercfg /requests` で、つないでいる間はサーバーと
+  クライアントの両方が SYSTEM と DISPLAY に出て、閉じたら消える、nosleep=0 なら出ない、を確かめる(ALL OK)。
+  サーバー側から切れたときも、クライアントはすぐ解く(記録で確認)。
+- 確かめていないこと: サービスの分身(SYSTEM)からの電源の要求。
+
 ### ファイルのコピー＆貼り付け(2026-10-05、server v6 / client v8、filexfer.c)
 
 利用者の要望: input-mouser のファイルのコピー＆貼り付けを iivnc にも。決めたこと: コピー＆貼り付け(エクスプローラー)、

@@ -166,6 +166,7 @@ static void fill(HWND dlg)
     CheckDlgButton(dlg, IDC_VIEWONLY, g_cfg.viewOnly ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, IDC_NOTIFY, g_cfg.notify ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, IDC_SHOWCURSOR, g_cfg.showCursor ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, IDC_NOSLEEP, g_cfg.noSleep ? BST_CHECKED : BST_UNCHECKED);
     {
         WCHAR s[MAX_PATH + 16];
         wsprintfW(s, L"設定: %s", g_iniPath);
@@ -266,6 +267,7 @@ static BOOL apply(HWND dlg)
     g_cfg.viewOnly = IsDlgButtonChecked(dlg, IDC_VIEWONLY) == BST_CHECKED;
     g_cfg.notify = IsDlgButtonChecked(dlg, IDC_NOTIFY) == BST_CHECKED;
     g_cfg.showCursor = IsDlgButtonChecked(dlg, IDC_SHOWCURSOR) == BST_CHECKED;
+    g_cfg.noSleep = IsDlgButtonChecked(dlg, IDC_NOSLEEP) == BST_CHECKED;
     SecureZeroMemory(pw, sizeof(pw));
     SecureZeroMemory(vpw, sizeof(vpw));
     SecureZeroMemory(newPw, sizeof(newPw));
@@ -278,6 +280,7 @@ static BOOL apply(HWND dlg)
         svc_signal_reload();
         return TRUE;
     }
+    power_update();
     if (recapture) capture_reset();
     if (restart || !app_listening()) PostMessageW(g_mainWnd, WM_APP_RESTART, 0, 0);
     return TRUE;

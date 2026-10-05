@@ -199,6 +199,43 @@ static void start_listening(void)
 const WCHAR *app_listen_error(void) { return g_listenError; }
 BOOL app_listening(void) { return g_listening; }
 
+/* ------------------------------------------------------------------ */
+/*  スリープさせない(nosleep=1)                                         */
+/* ------------------------------------------------------------------ */
+
+/* Windows の電源の要求(PowerSetRequest)で、スリープと画面の消灯を止める。
+   理由の文字列を付けるので、powercfg /requests で誰が止めているか見える */
+static void keep_awake(BOOL on, const WCHAR *reason)
+{
+    static HANDLE req;
+    static BOOL   active;
+    if (on == active) return;
+    if (!req) {
+        REASON_CONTEXT rc;
+        ZeroMemory(&rc, sizeof(rc));
+        rc.Version = POWER_REQUEST_CONTEXT_VERSION;
+        rc.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+        rc.Reason.SimpleReasonString = (LPWSTR)reason;
+        req = PowerCreateRequest(&rc);
+        if (req == INVALID_HANDLE_VALUE) req = NULL;
+        if (!req) { log_printf(L"スリープを止められない (%lu)", GetLastError()); return; }
+    }
+    if (on) {
+        PowerSetRequest(req, PowerRequestSystemRequired);
+        PowerSetRequest(req, PowerRequestDisplayRequired);
+    } else {
+        PowerClearRequest(req, PowerRequestSystemRequired);
+        PowerClearRequest(req, PowerRequestDisplayRequired);
+    }
+    active = on;
+    log_printf(on ? L"スリープと画面の消灯を止めた" : L"スリープと画面の消灯の止めを解いた");
+}
+
+void power_update(void)
+{
+    keep_awake(g_cfg.noSleep && g_clientCount > 0, L"iivnc-server: ビューアが接続している");
+}
+
 static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -238,6 +275,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_CLIENTS:
         app_update_tray();
         ui_refresh_status();
+        power_update();
         return 0;
 
     case WM_APP_NOTIFY: {
@@ -262,6 +300,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         Config old = g_cfg;
         config_load();
         log_printf(L"[agent] 設定を読み直した");
+        power_update();
         if (old.port != g_cfg.port || lstrcmpW(old.listen, g_cfg.listen) || (!g_listening && may_listen())) {
             server_stop();
             start_listening();
