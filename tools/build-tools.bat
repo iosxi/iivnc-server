@@ -17,6 +17,7 @@ set "CFLAGS=/nologo /utf-8 /W4 /O2 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WAR
 cl %CFLAGS% /Fobuild\tools\ /Febuild\tools\test_zlite.exe tools\test_zlite.c src\zdeflate.c src\zinflate.c || exit /b 1
 cl %CFLAGS% /Fobuild\tools\ /Febuild\tools\test_jpeg.exe tools\test_jpeg.c src\jpegenc.c ole32.lib windowscodecs.lib || exit /b 1
 cl %CFLAGS% /Fobuild\tools\ /Febuild\tools\test_des.exe tools\test_des.c src\vncdes.c || exit /b 1
+cl %CFLAGS% /Fobuild\tools\ /Febuild\tools\pastetest.exe tools\pastetest.c ole32.lib shell32.lib || exit /b 1
 echo OK
 exit /b 0
 :novs

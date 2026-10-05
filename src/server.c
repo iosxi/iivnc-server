@@ -17,6 +17,7 @@
  * ================================================================== */
 
 #include "iivnc.h"
+#include <wtsapi32.h>
 #include "vncdes.h"
 #include "jpegenc.h"
 #include <bcrypt.h>
@@ -302,7 +303,7 @@ static const int k_jpegQ[10] = { 15, 29, 41, 42, 62, 77, 79, 86, 92, 100 };
 static void set_encodings(Client *c, const BYTE *list, int n)
 {
     int i, pref = -1, quality = -1, fine = -1, subs = -1, comp = -1;
-    BOOL cr = 0, rc = 0, pp = 0, ds = 0, eds = 0, qk = 0, ec = 0, lr = 0, hasZ = 0, hasT = 0;
+    BOOL cr = 0, rc = 0, pp = 0, ds = 0, eds = 0, qk = 0, ec = 0, lr = 0, hasZ = 0, hasT = 0, fx = 0;
     for (i = 0; i < n; i++) {
         int e = (int)be32(list + i * 4);
         if (e == ENC_TIGHT || e == ENC_ZRLE || e == ENC_RAW) {
@@ -317,6 +318,7 @@ static void set_encodings(Client *c, const BYTE *list, int n)
         else if (e == PSE_QEMUKEY) qk = TRUE;
         else if (e == PSE_EXTCLIP) ec = TRUE;
         else if (e == PSE_LASTRECT) lr = TRUE;
+        else if (e == PSE_IIVNC_FILES) fx = TRUE;
         else if (e >= PSE_JPEG_Q0 && e <= PSE_JPEG_Q0 + 9) quality = e - PSE_JPEG_Q0;
         else if (e >= PSE_COMPRESS0 && e <= PSE_COMPRESS0 + 9) comp = e - PSE_COMPRESS0;
         else if (e >= PSE_FINEQ0 && e <= PSE_FINEQ0 + 100) fine = e - PSE_FINEQ0;
@@ -331,6 +333,8 @@ static void set_encodings(Client *c, const BYTE *list, int n)
     c->qemuKey = qk;
     if (ec && !c->extClip) c->extClipCapsPending = TRUE;
     c->extClip = ec;
+    if (fx && !c->fileXfer) c->fxHelloPending = TRUE;
+    c->fileXfer = fx;
     /* JPEG: 画質の指定があるときだけ使う */
     c->jpegQuality = fine >= 0 ? (fine < 1 ? 1 : fine) : quality >= 0 ? k_jpegQ[quality] : -1;
     if (subs >= 0) c->subsamp = subs == 0 ? JPE_444 : subs == 2 ? JPE_422 : JPE_420;   /* 1X / 2X / それ以上 */
@@ -462,6 +466,35 @@ static BOOL handle_cut_text(Client *c)
     return TRUE;
 }
 
+/* ファイルを受け渡してよい相手か(iivnc で、見るだけではない) */
+static BOOL fx_ok(Client *c)
+{
+    BOOL ok;
+    EnterCriticalSection(&c->cs);
+    ok = c->fileXfer && !c->viewOnly;
+    LeaveCriticalSection(&c->cs);
+    return ok;
+}
+
+/* FX_MSG: [u8 sub][u8 0][u8 0][u32 長さ(ビッグ エンディアン)][中身] */
+static BOOL handle_fx(Client *c)
+{
+    BYTE     h[7], *p;
+    unsigned len;
+    if (!rd(c, h, 7)) return FALSE;
+    len = be32(h + 3);
+    if (len > FX_MAX) return FALSE;
+    p = (BYTE *)malloc(len ? len : 1);
+    if (!p || !rd(c, p, (int)len)) { free(p); return FALSE; }
+    switch (h[0]) {
+    case FX_FILES: if (fx_ok(c)) fx_offer_received(c->id, p, (int)len); break;
+    case FX_READ:  if (fx_ok(c)) fx_request(c->id, p, (int)len); break;
+    case FX_DATA:  fx_deliver(c->id, p, (int)len); break;
+    }
+    free(p);
+    return TRUE;
+}
+
 static BOOL message_loop(Client *c)
 {
     BYTE t, b[32];
@@ -508,6 +541,9 @@ static BOOL message_loop(Client *c)
         case 6:                         /* ClientCutText */
             if (!handle_cut_text(c)) return FALSE;
             break;
+        case FX_MSG:                    /* ファイルのコピー＆貼り付け(iivnc どうし) */
+            if (!handle_fx(c)) return FALSE;
+            break;
         case 150:                       /* EnableContinuousUpdates(知らせていないので無視) */
             if (!rd(c, b, 9)) return FALSE;
             break;
@@ -544,6 +580,64 @@ static BOOL message_loop(Client *c)
 /* ------------------------------------------------------------------ */
 
 static void put32be(BYTE *p, unsigned v) { p[0] = (BYTE)(v >> 24); p[1] = (BYTE)(v >> 16); p[2] = (BYTE)(v >> 8); p[3] = (BYTE)v; }
+
+/* 送るのを待っている FX_MSG */
+typedef struct FxMsg { struct FxMsg *next; int len; BYTE data[1]; } FxMsg;
+
+static void send_fx(Client *c)
+{
+    BOOL   hello;
+    FxMsg *q, *n;
+    EnterCriticalSection(&c->cs);
+    hello = c->fxHelloPending;
+    c->fxHelloPending = FALSE;
+    q = c->fxHead;
+    c->fxHead = c->fxTail = NULL;
+    LeaveCriticalSection(&c->cs);
+    if (hello) {
+        /* [u32 LE 1 = 受け渡せる(見るだけでない)] */
+        /* [FX_MSG][FX_HELLO][0][0][長さ 4(ビッグ エンディアン)][u32 LE: 1 = 受け渡せる(見るだけでない)] */
+        BYTE m[12] = { FX_MSG, FX_HELLO, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0 };
+        m[8] = (BYTE)!c->viewOnly;
+        send_locked(c, m, 12);
+        log_printf(L"%s: ファイルのコピー＆貼り付け: %s", c->addr, c->viewOnly ? L"見るだけなので使わない" : L"使える");
+        if (g_cfg.fxOffer && !c->viewOnly) PostMessageW(g_mainWnd, WM_APP_FXOFFER, (WPARAM)c->id, 0);
+    }
+    for (; q; q = n) {
+        n = q->next;
+        if (!c->quit) send_locked(c, q->data, q->len);
+        free(q);
+    }
+}
+
+BOOL fx_host_send(int conn, int sub, const BYTE *p, int n)
+{
+    Client *c;
+    BOOL    found = FALSE;
+    FxMsg  *m = (FxMsg *)malloc(sizeof(FxMsg) + 8 + (size_t)n);
+    if (!m) return FALSE;
+    m->next = NULL;
+    m->len  = 8 + n;
+    m->data[0] = FX_MSG; m->data[1] = (BYTE)sub; m->data[2] = m->data[3] = 0;
+    m->data[4] = (BYTE)(n >> 24); m->data[5] = (BYTE)(n >> 16); m->data[6] = (BYTE)(n >> 8); m->data[7] = (BYTE)n;
+    memcpy(m->data + 8, p, (size_t)n);
+    AcquireSRWLockShared(&g_scr.lock);
+    for (c = g_scr.clients; c; c = c->next) {
+        if (c->id != conn || !c->active || c->quit) continue;
+        EnterCriticalSection(&c->cs);
+        if (c->fileXfer) {
+            if (c->fxTail) c->fxTail->next = m; else c->fxHead = m;
+            c->fxTail = m;
+            found = TRUE;
+        }
+        LeaveCriticalSection(&c->cs);
+        if (found) SetEvent(c->hWake);
+        break;
+    }
+    ReleaseSRWLockShared(&g_scr.lock);
+    if (!found) free(m);
+    return found;
+}
 
 static void send_clipboard(Client *c)
 {
@@ -758,6 +852,7 @@ static DWORD WINAPI writer_thread(void *arg)
         if (c->quit) break;
 
         send_clipboard(c);
+        send_fx(c);
 
         EnterCriticalSection(&c->cs);
         wantRich = c->richCursor;
@@ -976,6 +1071,11 @@ static DWORD WINAPI client_thread(void *arg)
     free(c->dirty);
     free(c->sendfb);
     free(c->clipOut);
+    fx_conn_closed(c->id);
+    {
+        FxMsg *q, *n;
+        for (q = c->fxHead; q; q = n) { n = q->next; free(q); }
+    }
     if (c->thrRead) CloseHandle(c->thrRead);
     free(c);
     return 0;
@@ -1154,6 +1254,65 @@ int server_list(WCHAR *buf, int cap)
     }
     ReleaseSRWLockShared(&g_scr.lock);
     return n;
+}
+
+/* ファイルを渡す相手(iivnc で、見るだけでない)を集める */
+static int fx_targets(int *ids, int cap, int only)
+{
+    Client *c;
+    int     n = 0;
+    AcquireSRWLockShared(&g_scr.lock);
+    for (c = g_scr.clients; c && n < cap; c = c->next) {
+        if (!c->active || c->quit || (only && c->id != only)) continue;
+        if (fx_ok(c)) ids[n++] = c->id;
+    }
+    ReleaseSRWLockShared(&g_scr.lock);
+    return n;
+}
+
+static void fx_offer_to(HDROP hd, int only)
+{
+    int   ids[8], n = fx_targets(ids, 8, only), i, len = 0;
+    BYTE *out = NULL;
+    if (!n || !fx_make_offer(ids, n, hd, &out, &len)) return;
+    for (i = 0; i < n; i++) fx_host_send(ids[i], FX_FILES, out, len);
+    HeapFree(GetProcessHeap(), 0, out);
+}
+
+void server_files_changed(HDROP hd)
+{
+    fx_offer_to(hd, 0);
+}
+
+void server_files_changed_paths(const WCHAR *paths)
+{
+    int   ids[8], n = fx_targets(ids, 8, 0), i, len = 0;
+    BYTE *out = NULL;
+    if (!n || !fx_make_offer_paths(ids, n, paths, &out, &len)) return;
+    for (i = 0; i < n; i++) fx_host_send(ids[i], FX_FILES, out, len);
+    HeapFree(GetProcessHeap(), 0, out);
+}
+
+/* サービスの分身は SYSTEM。ファイルは、コンソールにログインしている利用者として読む */
+HANDLE fx_host_user_token(void)
+{
+    HANDLE t = NULL;
+    if (g_runMode != RUN_AGENT) return NULL;
+    if (!WTSQueryUserToken(WTSGetActiveConsoleSessionId(), &t)) return NULL;
+    return t;
+}
+
+void server_fx_offer_current(int id)
+{
+    int i;
+    if (!IsClipboardFormatAvailable(CF_HDROP)) { log_printf(L"[fxoffer] クリップボードにファイルが無い"); return; }
+    for (i = 0; i < 10 && !OpenClipboard(g_mainWnd); i++) Sleep(20);
+    if (i == 10) return;
+    {
+        HDROP hd = (HDROP)GetClipboardData(CF_HDROP);
+        if (hd) fx_offer_to(hd, id);
+    }
+    CloseClipboard();
 }
 
 void server_clipboard_changed(const char *utf8, int len)

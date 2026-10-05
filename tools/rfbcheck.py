@@ -154,7 +154,7 @@ class Client:
             if t == 3:          # ServerCutText
                 self.read(3)
                 ln = struct.unpack('>i', self.read(4))[0]
-                self.read(abs(ln))
+                self.cut = self.read(abs(ln))     # 受け取った文字(拡張でなければ Latin-1)
             elif t == 1:        # 色の表
                 self.read(3); n = self.u16() if False else None
                 raise RuntimeError('色の表は使っていない')

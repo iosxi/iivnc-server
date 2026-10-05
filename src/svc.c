@@ -180,6 +180,40 @@ static DWORD WINAPI agent_selftest(void *arg)
     return 0;
 }
 
+/* 分身は SYSTEM で動く。相手から来たファイルをクリップボードに置くと、ログインしている人の
+   エクスプローラーが COM でこのプロセスへ中身を読みに来る。既定では同じ利用者(SYSTEM)からしか
+   受け付けず、整合性レベルが低い(普通の権限の)呼び出しも断るので、対話ログオンの利用者と
+   中位の整合性レベルからの呼び出しを受け付ける。COM を使う前に 1 回だけ呼ぶ。
+   (この設定が無いと、利用者の側からは中身を取り出せず DV_E_FORMATETC になった。2026-10-05 実測)
+   CoInitializeSecurity は絶対形式の記述子しか受けない(自己相対形式だと 0x80070551)ので変換する。
+   記述子はプロセスが終わるまで持っておく */
+void agent_com_security(void)
+{
+    PSECURITY_DESCRIPTOR rel = NULL, abs;
+    DWORD   sdSz = 0, daclSz = 0, saclSz = 0, ownSz = 0, grpSz = 0;
+    BYTE   *blk;
+    HRESULT hr;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:SYG:SYD:(A;;0x3;;;SY)(A;;0x3;;;IU)(A;;0x3;;;BA)S:(ML;;NX;;;ME)", SDDL_REVISION_1, &rel, NULL)) {
+        log_printf(L"COM の受け付けの設定を作れない (%lu)", GetLastError());
+        return;
+    }
+    MakeAbsoluteSD(rel, NULL, &sdSz, NULL, &daclSz, NULL, &saclSz, NULL, &ownSz, NULL, &grpSz);
+    blk = (BYTE *)calloc(1, (size_t)sdSz + daclSz + saclSz + ownSz + grpSz + 64);
+    if (!blk) { LocalFree(rel); return; }
+    abs = (PSECURITY_DESCRIPTOR)blk;
+    if (!MakeAbsoluteSD(rel, abs, &sdSz, (PACL)(blk + sdSz), &daclSz, (PACL)(blk + sdSz + daclSz), &saclSz,
+                        (PSID)(blk + sdSz + daclSz + saclSz), &ownSz, (PSID)(blk + sdSz + daclSz + saclSz + ownSz), &grpSz)) {
+        log_printf(L"COM の受け付けの設定を変換できない (%lu)", GetLastError());
+        LocalFree(rel);
+        return;
+    }
+    LocalFree(rel);
+    hr = CoInitializeSecurity(abs, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IDENTIFY, NULL, EOAC_NONE, NULL);
+    log_printf(L"COM の受け付け: 対話ログオンの利用者から (0x%08lX)", (unsigned long)hr);
+}
+
 BOOL agent_init(void)
 {
     SECURITY_ATTRIBUTES sa;
@@ -782,14 +816,65 @@ enum { IDT_SETTINGS = 200, IDT_DISCONNECT, IDT_HIDE };
 
 static NOTIFYICONDATAW g_tn;
 static HICON           g_tIdle, g_tActive;
-static BOOL            g_tAdded;
+static BOOL            g_tAdded, g_tHidden;     /* g_tHidden: 「通知領域から消す」(クリップボードの受け渡しは続ける) */
 static LONG            g_tNotifySeq = -1;
 static UINT            g_tTaskbarCreated;
+
+/* 利用者がコピーしたものを分身へ渡す(分身は SYSTEM なので、自分ではクリップボードを読めない) */
+static void tray_clip_forward(HWND hwnd)
+{
+    HWND   agent = FindWindowW(TRAY_CLASS, AGENT_TITLE), owner = GetClipboardOwner();
+    DWORD  apid = 0, opid = 0;
+    COPYDATASTRUCT cd;
+    WCHAR *buf = NULL;
+    size_t chars = 0;
+    int    i;
+    if (!agent) return;
+    GetWindowThreadProcessId(agent, &apid);
+    if (owner) GetWindowThreadProcessId(owner, &opid);
+    if (opid && opid == apid) return;       /* 分身が置いた(相手から来た)もの。送り返さない */
+    for (i = 0; i < 10 && !OpenClipboard(hwnd); i++) Sleep(20);
+    if (i == 10) return;
+    ZeroMemory(&cd, sizeof(cd));
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        HDROP hd = (HDROP)GetClipboardData(CF_HDROP);
+        WCHAR *p = hd ? fx_hdrop_paths(hd) : NULL;
+        if (p) {
+            const WCHAR *q = p;
+            while (*q) q += lstrlenW(q) + 1;
+            chars = (size_t)(q - p) + 1;
+            buf = (WCHAR *)malloc(chars * sizeof(WCHAR));
+            if (buf) memcpy(buf, p, chars * sizeof(WCHAR));
+            HeapFree(GetProcessHeap(), 0, p);
+            cd.dwData = CD_CLIP_FILES;
+        }
+    } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        HANDLE h = GetClipboardData(CF_UNICODETEXT);
+        const WCHAR *w = h ? (const WCHAR *)GlobalLock(h) : NULL;
+        if (w) {
+            chars = wcslen(w) + 1;
+            if (chars <= (8u << 20)) {
+                buf = (WCHAR *)malloc(chars * sizeof(WCHAR));
+                if (buf) memcpy(buf, w, chars * sizeof(WCHAR));
+            }
+            GlobalUnlock(h);
+            cd.dwData = CD_CLIP_TEXT;
+        }
+    }
+    CloseClipboard();
+    if (!buf) return;
+    cd.cbData = (DWORD)(chars * sizeof(WCHAR));
+    cd.lpData = buf;
+    SendMessageTimeoutW(agent, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&cd, SMTO_ABORTIFHUNG, 3000, NULL);
+    free(buf);
+}
 
 static void tray_refresh(HWND hwnd)
 {
     SvcStatus st;
-    BOOL ok = svc_read_status(&st);
+    BOOL ok;
+    if (g_tHidden) return;
+    ok = svc_read_status(&st);
     g_tn.cbSize = sizeof(g_tn);
     g_tn.hWnd = hwnd;
     g_tn.uID = 1;
@@ -872,6 +957,9 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         return 0;
+    case WM_CLIPBOARDUPDATE:
+        tray_clip_forward(hwnd);
+        return 0;
     case WM_APP_TRAY:
         switch (LOWORD(lp)) {
         /* 新しい形式では、左クリック 1 回で WM_LBUTTONUP と NIN_SELECT の両方が来る
@@ -894,7 +982,11 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDT_SETTINGS:   svc_run_elevated(L"-svcsettings", NULL, FALSE, NULL); break;
         case IDT_DISCONNECT: svc_signal_disconnect(); break;
-        case IDT_HIDE:       DestroyWindow(hwnd); break;
+        case IDT_HIDE:       /* アイコンだけ消す。クリップボードの受け渡しのため、プロセスは残す */
+            if (g_tAdded) Shell_NotifyIconW(NIM_DELETE, &g_tn);
+            g_tAdded = FALSE;
+            g_tHidden = TRUE;
+            break;
         }
         return 0;
     case WM_APP_COMMAND:
@@ -948,6 +1040,7 @@ int svc_tray_main(int cmd)
     tray_refresh(hwnd);
     SetTimer(hwnd, TIMER_POLL, 500, NULL);
     SetTimer(hwnd, TIMER_SVC, 3000, NULL);
+    AddClipboardFormatListener(hwnd);       /* 利用者がコピーしたものを分身へ渡す */
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);

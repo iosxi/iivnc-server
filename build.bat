@@ -26,7 +26,7 @@ cd /d "%~dp0"
 if not exist build\obj mkdir build\obj
 rc /nologo /fo build\obj\iivnc-server.res src\iivnc-server.rc || exit /b 1
 
-set "SRC=src\main.c src\config.c src\capture.c src\pool.c src\encode.c src\server.c src\input.c src\clip.c src\ui.c src\theme.c src\zdeflate.c src\zinflate.c src\jpegenc.c src\vncdes.c src\svc.c src\fwrules.c"
+set "SRC=src\main.c src\config.c src\capture.c src\pool.c src\encode.c src\server.c src\input.c src\clip.c src\ui.c src\theme.c src\zdeflate.c src\zinflate.c src\jpegenc.c src\vncdes.c src\svc.c src\fwrules.c src\filexfer.c"
 set "LIBS=user32.lib gdi32.lib shell32.lib comctl32.lib dwmapi.lib uxtheme.lib ole32.lib ws2_32.lib iphlpapi.lib bcrypt.lib d3d11.lib dxgi.lib synchronization.lib advapi32.lib dxguid.lib wtsapi32.lib userenv.lib oleaut32.lib"
 set "CFLAGS=/nologo /utf-8 /W4 /wd4201 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00"
 

@@ -136,6 +136,7 @@ void config_load(void)
         else if (!_stricmp(key, "display")) g_cfg.display = atoi(val);
         else if (!_stricmp(key, "notify")) g_cfg.notify = atoi(val) != 0;
         else if (!_stricmp(key, "showcursor")) g_cfg.showCursor = atoi(val) != 0;
+        else if (!_stricmp(key, "fxoffer")) g_cfg.fxOffer = atoi(val) != 0;
         else if (!_stricmp(key, "maxfps")) g_cfg.maxFps = atoi(val);
         else if (!_stricmp(key, "theme")) g_cfg.theme = !_stricmp(val, "light") ? 1 : !_stricmp(val, "dark") ? 2 : 0;
         else if (!_stricmp(key, "log")) g_cfg.log = atoi(val) != 0;

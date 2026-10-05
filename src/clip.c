@@ -8,6 +8,14 @@
  *
  *  相手から来た文字は、ここでクリップボードに置く。自分で置いたときの
  *  WM_CLIPBOARDUPDATE は無視する(相手へ送り返さない)。
+ *
+ *  エクスプローラーでファイルをコピーした(CF_HDROP)ときは、ファイルの一覧を
+ *  渡す(filexfer.c。中身は相手が貼り付けたときに送る)。
+ *
+ *  サービスの分身(SYSTEM)からは、利用者がコピーしたものが見えない(クリップボードの形式が 0 個に
+ *  見える。利用者になりすましても同じ。2026-10-05 実測)。そこで分身では自分では読まず、利用者の
+ *  権限で動くサービスのトレイが読んで WM_COPYDATA で渡す(clip_text_from_tray、svc.c)。
+ *  分身が置く(相手から来た文字・ファイル)のはできる。
  * ================================================================== */
 
 #include "iivnc.h"
@@ -71,7 +79,34 @@ void clip_on_update(HWND hwnd)
         g_ignoreNext = FALSE;
         return;
     }
+    if (g_runMode == RUN_AGENT) return;     /* 分身は読めない。サービスのトレイから届く */
+    if (fx_clipboard_is_ours()) return;     /* 相手から来たファイルを置いた */
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        if (open_clipboard(hwnd)) {
+            HDROP hd = (HDROP)GetClipboardData(CF_HDROP);
+            if (hd) server_files_changed(hd);
+            CloseClipboard();
+        }
+        return;
+    }
     t = read_clipboard(hwnd, &len);
+    if (!t) return;
+    if (len > (16 << 20)) { free(t); return; }
+    EnterCriticalSection(&g_cs);
+    if (g_text && g_len == len && !memcmp(g_text, t, (size_t)len)) {
+        LeaveCriticalSection(&g_cs);
+        free(t);
+        return;
+    }
+    LeaveCriticalSection(&g_cs);
+    server_clipboard_changed(t, len);
+    set_current(t, len);
+}
+
+void clip_text_from_tray(const WCHAR *text)
+{
+    int   len = 0;
+    char *t = utf16_to_utf8(text, &len);
     if (!t) return;
     if (len > (16 << 20)) { free(t); return; }
     EnterCriticalSection(&g_cs);

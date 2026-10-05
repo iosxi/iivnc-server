@@ -39,7 +39,6 @@
 #include <iphlpapi.h>
 #include <stdarg.h>
 
-#define TRAY_CLASS L"iivnc.Server.Tray"
 #define TRAY_ID    1
 
 enum { ID_SETTINGS = 100, ID_DISCONNECT_ALL, ID_EXIT };
@@ -285,6 +284,26 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         clip_set_from_remote(hwnd, (WCHAR *)lp);
         return 0;
 
+    case WM_APP_FXOFFER:
+        server_fx_offer_current((int)wp);
+        return 0;
+
+    case WM_COPYDATA: {                 /* 分身: サービスのトレイが読んだ、利用者のクリップボード */
+        const COPYDATASTRUCT *cd = (const COPYDATASTRUCT *)lp;
+        if (g_runMode != RUN_AGENT || !cd || !cd->lpData || cd->cbData < 2 * sizeof(WCHAR) || (cd->cbData & 1)) return FALSE;
+        {
+            size_t n = cd->cbData / sizeof(WCHAR);
+            WCHAR *w = (WCHAR *)malloc((n + 2) * sizeof(WCHAR));
+            if (!w) return FALSE;
+            memcpy(w, cd->lpData, cd->cbData);
+            w[n] = w[n + 1] = 0;            /* 終わりを必ず付ける */
+            if (cd->dwData == CD_CLIP_TEXT) clip_text_from_tray(w);
+            else if (cd->dwData == CD_CLIP_FILES) server_files_changed_paths(w);
+            free(w);
+        }
+        return TRUE;
+    }
+
     case WM_CLIPBOARDUPDATE:
         clip_on_update(hwnd);
         return 0;
@@ -472,11 +491,13 @@ skip_mutex:
     wc.lpszClassName = TRAY_CLASS;
     RegisterClassW(&wc);
     /* 別のインスタンスが探せるよう、タイトルに設定ファイルのパスを入れておく */
-    g_mainWnd = CreateWindowExW(WS_EX_TOOLWINDOW, TRAY_CLASS, g_runMode == RUN_AGENT ? L"iivnc-server agent" : g_iniPath,
+    g_mainWnd = CreateWindowExW(WS_EX_TOOLWINDOW, TRAY_CLASS, g_runMode == RUN_AGENT ? AGENT_TITLE : g_iniPath,
                                 WS_POPUP, 0, 0, 0, 0, NULL, NULL, inst, NULL);
     if (!g_mainWnd) return 1;
     if (g_runMode == RUN_AGENT) {
+        agent_com_security();
         agent_init();
+        ChangeWindowMessageFilterEx(g_mainWnd, WM_COPYDATA, MSGFLT_ALLOW, NULL);   /* 利用者の権限のトレイから */
         SetTimer(g_mainWnd, 1, 5000, NULL);
     } else {
         ChangeWindowMessageFilterEx(g_mainWnd, g_wmTaskbarCreated, MSGFLT_ALLOW, NULL);

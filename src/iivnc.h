@@ -27,6 +27,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -34,8 +35,8 @@
 #include "zlite.h"
 
 #define APP_NAME     L"iivnc-server"
-#define APP_VERSION  L"1.4.0"
-#define APP_VERSION_A "1.4.0"
+#define APP_VERSION  L"1.5.0"
+#define APP_VERSION_A "1.5.0"
 
 #define WM_APP_TRAY     (WM_APP + 1)
 #define WM_APP_COMMAND  (WM_APP + 2)    /* 別のプロセスから(-exit など) */
@@ -45,6 +46,11 @@
 #define WM_APP_RESTART  (WM_APP + 6)    /* 待ち受けをやり直す(設定が変わった) */
 #define WM_APP_RELOAD   (WM_APP + 7)    /* 分身: 設定を読み直す */
 #define WM_APP_DISCONNECT (WM_APP + 8)  /* 分身: 全員を切断 */
+#define WM_APP_FXOFFER  (WM_APP + 9)    /* 検証用: wParam の相手へ、今クリップボードにあるファイルを渡す */
+#define TRAY_CLASS      L"iivnc.Server.Tray"
+#define AGENT_TITLE     L"iivnc-server agent"   /* 分身の窓の題(サービスのトレイが探す) */
+#define CD_CLIP_TEXT    1                   /* WM_COPYDATA: サービスのトレイ → 分身。利用者がコピーした文字(UTF-16) */
+#define CD_CLIP_FILES   2                   /* 同じく、コピーしたファイルの一覧(0 区切り、最後に 0 が 2 つ) */
 
 #define CMD_EXIT 1
 
@@ -61,6 +67,7 @@ typedef struct Config {
     int   display;              /* 0 = すべての画面、n = \\.\DISPLAYn だけ */
     int   notify;               /* 1 = 接続・切断を通知で知らせる */
     int   showCursor;           /* 1 = Windows がカーソルを隠していても(マウスが無い PC など)相手に見せる */
+    int   fxOffer;              /* 検証用(ini の fxoffer=1。保存しない): 相手がつながったら、今クリップボードにあるファイルを渡す */
     int   theme;                /* 0 = システム、1 = ライト、2 = ダーク */
     int   log;
     int   maxFps;               /* 0 = 制限しない */
@@ -169,6 +176,11 @@ struct Client {
     POINT   pointerFromClient;  /* この相手が最後に動かした位置 */
     BOOL    qemuAckPending, extClipCapsPending;
 
+    /* ファイルのコピー＆貼り付け(cs で守る) */
+    BOOL    fileXfer;           /* 相手が iivnc で、ファイルを受け渡せる */
+    BOOL    fxHelloPending;     /* 「受け渡せる」を知らせる */
+    struct FxMsg *fxHead, *fxTail;  /* 送るのを待っている FX_MSG(書き手のスレッドが送る) */
+
     /* クリップボード(cs で守る) */
     char   *clipOut;            /* 相手へ送る UTF-8(NULL = 無し) */
     int     clipOutLen;
@@ -200,6 +212,27 @@ void server_disconnect_all(void);
 void server_disconnect(int id);
 int  server_list(WCHAR *buf, int cap);      /* 「アドレス」を改行で並べる。戻り値は数 */
 void server_clipboard_changed(const char *utf8, int len);
+void server_files_changed(HDROP hd);            /* クリップボードにファイルがコピーされた(メインのスレッド) */
+void server_files_changed_paths(const WCHAR *paths);    /* 同じく、パスの一覧で(サービスのトレイから) */
+void clip_text_from_tray(const WCHAR *text);    /* 分身: サービスのトレイが読んだ利用者の文字 */
+void server_fx_offer_current(int id);           /* 検証用: 今のクリップボードのファイルを id の相手へ */
+
+/* filexfer.c: ファイルのコピー＆貼り付け(iivnc-client と同じファイル) */
+#define FX_MSG          105                 /* RFB のメッセージ番号(両向き。iivnc どうしだけで使う) */
+#define PSE_IIVNC_FILES ((int)0x69467831)   /* クライアントが「ファイルを受け渡せる」と知らせる疑似エンコーディング */
+#define FX_MAX          (16 << 20)          /* 1 つのメッセージの中身の上限 */
+enum { FX_HELLO = 1, FX_FILES, FX_READ, FX_DATA };
+BOOL fx_make_offer(const int *conns, int nconn, HDROP hd, BYTE **out, int *outLen);
+BOOL fx_make_offer_paths(const int *conns, int nconn, const WCHAR *paths, BYTE **out, int *outLen);
+WCHAR *fx_hdrop_paths(HDROP hd);                                /* 0 区切りの一覧(HeapFree) */
+HANDLE fx_host_user_token(void);                                /* なりすます利用者(無ければ NULL。呼んだ側が閉じる) */
+void fx_request(int conn, const BYTE *p, int n);
+void fx_deliver(int conn, const BYTE *p, int n);
+void fx_conn_closed(int conn);
+void fx_offer_received(int conn, const BYTE *p, int n);
+BOOL fx_clipboard_is_ours(void);
+void fx_stop(void);
+BOOL fx_host_send(int conn, int sub, const BYTE *p, int n);    /* server.c: id の相手へ FX_MSG を送る */
 BOOL client_send(Client *c, const void *data, int len);   /* sendLock の中で呼ぶ */
 void client_wake(Client *c);
 
@@ -375,6 +408,7 @@ int  fw_remove(const WCHAR *keep);                              /* 管理者で�
 int  fw_remove_elevated(HWND owner, const WCHAR *keep, const WCHAR *args);
 void fw_describe(const FwInfo *fi, WCHAR *s, int cap);
 BOOL agent_init(void);
+void agent_com_security(void);              /* 分身: ログインしている人のエクスプローラーからの COM を受け付ける */
 void agent_status_update(void);
 void agent_notify(const WCHAR *s);
 void agent_request_sas(void);
