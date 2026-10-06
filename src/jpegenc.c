@@ -1,18 +1,31 @@
 /* ==================================================================
- * jpegenc.c - ベースライン JPEG の符号化
+ * jpegenc.c - ベースライン JPEG の符号化(SSE2)
  *
  *  Tight の JPEG 矩形は、受け手が libjpeg などでそのまま読める
  *  完全な JPEG(JFIF)でなければならない。量子化表は IJG の品質の
  *  換算、ハフマン表は規格の付録 K の標準の表を使う。
  *
- *  DCT は AAN の浮動小数点版(libjpeg の jfdctflt と同じ)。
- *  量子化は AAN の倍率をかけた除数の逆数をかけて丸める。
+ *  速さのために、x64 なら必ずある SSE2 だけを使う(AVX2 は古い CPU に
+ *  無いので使わない。Windows 10 の機械すべてで動くように)。
+ *
+ *   色の変換  8 画素ずつ。15 ビットの固定小数点(pmaddwd)。
+ *   DCT       libjpeg の整数版(islow、jfdctint.c)と同じ計算を、
+ *             8 列(8 行)同時に。縦→横の順に行い、結果は転置した
+ *             並び(列が先)のまま量子化とジグザグの表で読み替える。
+ *   量子化    除算を、libjpeg-turbo と同じ逆数・補正・倍率のかけ算に
+ *             置き換える(結果は除算と一致する)。
+ *   ハフマン  0 でない係数の位置を 64 ビットの地図にして飛び越す。
+ *             書き出しは 4 バイトずつ(0xFF が無ければそのまま)。
+ *
+ *  以前の浮動小数点の版(1 画素・1 係数ずつ)より 1920×1080 で
+ *  数倍速い。大きさ・画質は libjpeg(PIL)とほぼ同じ。
  * ================================================================== */
 
 #include "jpegenc.h"
 #include <string.h>
 #include <stdlib.h>
 #include <intrin.h>
+#include <emmintrin.h>
 
 /* ------------------------------------------------------------------ */
 /*  表                                                                  */
@@ -97,20 +110,38 @@ static void init_tables(void)
     _InterlockedExchange(&g_ready, 1);
 }
 
+/* 転置した並び(列が先、t[k * 8 + m] = 係数[m][k])でのジグザグの順 */
+static unsigned char g_tzig[64];
+
+static void init_tzig(void)
+{
+    int i;
+    for (i = 0; i < 64; i++)
+        g_tzig[i] = (unsigned char)((k_zigzag[i] & 7) * 8 + (k_zigzag[i] >> 3));
+}
+
 struct JpegEnc {
-    int           quality;
-    unsigned char qLum[64], qChr[64];   /* 自然順 */
-    float         dLum[64], dChr[64];   /* 除数の逆数(自然順) */
+    int            quality;
+    unsigned char  qLum[64], qChr[64];  /* 自然順(見出しに書く) */
+    unsigned short qt[2][3][64];        /* [輝度 / 色差][逆数 / 補正 / 倍率]、転置した並び */
+    short         *plane;               /* MCU 1 行分の Y・Cb・Cr と、間引いた Cb・Cr */
+    size_t         planeCap;            /* short の数 */
 };
 
 JpegEnc *jpe_new(void)
 {
     JpegEnc *e = (JpegEnc *)calloc(1, sizeof(JpegEnc));
     init_tables();
+    if (!g_tzig[1]) init_tzig();
     return e;
 }
 
-void jpe_free(JpegEnc *e) { free(e); }
+void jpe_free(JpegEnc *e)
+{
+    if (!e) return;
+    free(e->plane);
+    free(e);
+}
 
 size_t jpe_bound(int w, int h)
 {
@@ -118,10 +149,28 @@ size_t jpe_bound(int w, int h)
     return blocks * 420 + 1024;
 }
 
+/* 除数 → 逆数・補正・倍率(libjpeg-turbo の compute_reciprocal と同じ)。
+ * ((|x| + 補正) × 逆数 >> 16) × 倍率 >> 16 が (|x| + 除数/2) / 除数 と一致する。 */
+static void reciprocal(unsigned divisor, unsigned short *recip, unsigned short *corr, unsigned short *scale)
+{
+    unsigned long b;
+    unsigned fq, fr, c;
+    int r;
+    _BitScanReverse(&b, divisor);
+    r = 16 + (int)b;
+    fq = (1u << r) / divisor;
+    fr = (1u << r) % divisor;
+    c = divisor / 2;
+    if (fr == 0) { fq >>= 1; r--; }
+    else if (fr <= divisor / 2) c++;
+    else fq++;
+    *recip = (unsigned short)fq;
+    *corr  = (unsigned short)c;
+    *scale = (unsigned short)(1u << (32 - r));
+}
+
 static void set_quality(JpegEnc *e, int q)
 {
-    static const float aan[8] = { 1.0f, 1.387039845f, 1.306562965f, 1.175875602f,
-                                  1.0f, 0.785694958f, 0.541196100f, 0.275899379f };
     int i, scale;
     if (q < 1) q = 1;
     if (q > 100) q = 100;
@@ -130,10 +179,12 @@ static void set_quality(JpegEnc *e, int q)
     scale = q < 50 ? 5000 / q : 200 - q * 2;
     for (i = 0; i < 64; i++) {
         int a = (k_lumQ[i] * scale + 50) / 100, b = (k_chrQ[i] * scale + 50) / 100;
+        int t = (i & 7) * 8 + (i >> 3);
         e->qLum[i] = (unsigned char)(a < 1 ? 1 : a > 255 ? 255 : a);
         e->qChr[i] = (unsigned char)(b < 1 ? 1 : b > 255 ? 255 : b);
-        e->dLum[i] = 1.0f / ((float)e->qLum[i] * aan[i >> 3] * aan[i & 7] * 8.0f);
-        e->dChr[i] = 1.0f / ((float)e->qChr[i] * aan[i >> 3] * aan[i & 7] * 8.0f);
+        /* islow の DCT の結果は 8 倍なので、除数も 8 倍 */
+        reciprocal(e->qLum[i] * 8u, &e->qt[0][0][t], &e->qt[0][1][t], &e->qt[0][2][t]);
+        reciprocal(e->qChr[i] * 8u, &e->qt[1][0][t], &e->qt[1][1][t], &e->qt[1][2][t]);
     }
 }
 
@@ -143,68 +194,200 @@ static void set_quality(JpegEnc *e, int q)
 
 typedef struct {
     unsigned char     *p;
-    unsigned long long buf;
+    unsigned long long buf;     /* 下位 cnt ビットが未出力 */
     int                cnt;
 } JW;
 
+/* size は 27 以下(符号 16 + 値 11) */
 static __forceinline void jw_put(JW *w, unsigned code, int size)
 {
     w->buf = (w->buf << size) | code;
     w->cnt += size;
-    while (w->cnt >= 8) {
-        unsigned char c = (unsigned char)(w->buf >> (w->cnt - 8));
-        *w->p++ = c;
-        if (c == 0xFF) *w->p++ = 0;
-        w->cnt -= 8;
+    if (w->cnt >= 32) {
+        unsigned v = (unsigned)(w->buf >> (w->cnt - 32));
+        w->cnt -= 32;
+        if (!((~v - 0x01010101u) & v & 0x80808080u)) {     /* 0xFF のバイトが無い */
+            v = _byteswap_ulong(v);
+            memcpy(w->p, &v, 4);
+            w->p += 4;
+        } else {
+            int s;
+            for (s = 24; s >= 0; s -= 8) {
+                unsigned char c = (unsigned char)(v >> s);
+                *w->p++ = c;
+                if (c == 0xFF) *w->p++ = 0;
+            }
+        }
     }
 }
 
 /* ------------------------------------------------------------------ */
-/*  DCT と符号化                                                        */
+/*  色の変換と間引き                                                    */
 /* ------------------------------------------------------------------ */
 
-static void fdct(float *d)
-{
-    float t0, t1, t2, t3, t4, t5, t6, t7, t10, t11, t12, t13, z1, z2, z3, z4, z5, z11, z13;
-    float *p;
-    int i;
+/* (a, b) の組を pmaddwd の係数に */
+#define PAIR(a, b) _mm_set1_epi32((int)(((unsigned)(unsigned short)(short)(b) << 16) | (unsigned short)(short)(a)))
 
-    for (p = d, i = 0; i < 8; i++, p += 8) {
-        t0 = p[0] + p[7]; t7 = p[0] - p[7];
-        t1 = p[1] + p[6]; t6 = p[1] - p[6];
-        t2 = p[2] + p[5]; t5 = p[2] - p[5];
-        t3 = p[3] + p[4]; t4 = p[3] - p[4];
-        t10 = t0 + t3; t13 = t0 - t3; t11 = t1 + t2; t12 = t1 - t2;
-        p[0] = t10 + t11; p[4] = t10 - t11;
-        z1 = (t12 + t13) * 0.707106781f;
-        p[2] = t13 + z1; p[6] = t13 - z1;
-        t10 = t4 + t5; t11 = t5 + t6; t12 = t6 + t7;
-        z5 = (t10 - t12) * 0.382683433f;
-        z2 = 0.541196100f * t10 + z5;
-        z4 = 1.306562965f * t12 + z5;
-        z3 = t11 * 0.707106781f;
-        z11 = t7 + z3; z13 = t7 - z3;
-        p[5] = z13 + z2; p[3] = z13 - z2;
-        p[1] = z11 + z4; p[7] = z11 - z4;
+/* BGRX 8 画素 → Y - 128、Cb、Cr(どれも -128..127)。係数は 2^15 倍、0.5 を足して丸める */
+static __forceinline void color8(const unsigned char *s, short *py, short *pcb, short *pcr)
+{
+    const __m128i m = _mm_set1_epi32(0xFF), one = _mm_set1_epi16(1);
+    __m128i p0 = _mm_loadu_si128((const __m128i *)s), p1 = _mm_loadu_si128((const __m128i *)(s + 16));
+    __m128i b = _mm_packs_epi32(_mm_and_si128(p0, m), _mm_and_si128(p1, m));
+    __m128i g = _mm_packs_epi32(_mm_and_si128(_mm_srli_epi32(p0, 8), m), _mm_and_si128(_mm_srli_epi32(p1, 8), m));
+    __m128i r = _mm_packs_epi32(_mm_and_si128(_mm_srli_epi32(p0, 16), m), _mm_and_si128(_mm_srli_epi32(p1, 16), m));
+    __m128i rgL = _mm_unpacklo_epi16(r, g), rgH = _mm_unpackhi_epi16(r, g);
+    __m128i b1L = _mm_unpacklo_epi16(b, one), b1H = _mm_unpackhi_epi16(b, one);
+#define CONV(krg, kb) _mm_packs_epi32( \
+        _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(rgL, krg), _mm_madd_epi16(b1L, kb)), 15), \
+        _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(rgH, krg), _mm_madd_epi16(b1H, kb)), 15))
+    _mm_storeu_si128((__m128i *)py, _mm_sub_epi16(CONV(PAIR(9798, 19235), PAIR(3735, 16384)), _mm_set1_epi16(128)));
+    _mm_storeu_si128((__m128i *)pcb, CONV(PAIR(-5529, -10855), PAIR(16384, 16384)));
+    _mm_storeu_si128((__m128i *)pcr, CONV(PAIR(16384, -13720), PAIR(-2664, 16384)));
+#undef CONV
+}
+
+/* 画素の rows 行(y0 から。下の端は最後の行を繰り返す)を幅 W の平面へ(右の端は最後の画素を繰り返す) */
+static void convert_rows(const unsigned char *px, int stride, int w, int h, int y0, int rows, int W,
+                         short *Y, short *Cb, short *Cr)
+{
+    unsigned char tmp[32];
+    int x, y, i;
+    for (y = 0; y < rows; y++) {
+        int sy = y0 + y < h ? y0 + y : h - 1;
+        const unsigned char *row = px + (size_t)sy * (size_t)stride;
+        short *py = Y + (size_t)y * W, *pb = Cb + (size_t)y * W, *pr = Cr + (size_t)y * W;
+        for (x = 0; x + 8 <= w; x += 8)
+            color8(row + (size_t)x * 4, py + x, pb + x, pr + x);
+        for (; x < W; x += 8) {
+            for (i = 0; i < 8; i++) {
+                int sx = x + i < w ? x + i : w - 1;
+                memcpy(tmp + i * 4, row + (size_t)sx * 4, 4);
+            }
+            color8(tmp, py + x, pb + x, pr + x);
+        }
     }
-    for (p = d, i = 0; i < 8; i++, p++) {
-        t0 = p[0] + p[56]; t7 = p[0] - p[56];
-        t1 = p[8] + p[48]; t6 = p[8] - p[48];
-        t2 = p[16] + p[40]; t5 = p[16] - p[40];
-        t3 = p[24] + p[32]; t4 = p[24] - p[32];
-        t10 = t0 + t3; t13 = t0 - t3; t11 = t1 + t2; t12 = t1 - t2;
-        p[0] = t10 + t11; p[32] = t10 - t11;
-        z1 = (t12 + t13) * 0.707106781f;
-        p[16] = t13 + z1; p[48] = t13 - z1;
-        t10 = t4 + t5; t11 = t5 + t6; t12 = t6 + t7;
-        z5 = (t10 - t12) * 0.382683433f;
-        z2 = 0.541196100f * t10 + z5;
-        z4 = 1.306562965f * t12 + z5;
-        z3 = t11 * 0.707106781f;
-        z11 = t7 + z3; z13 = t7 - z3;
-        p[40] = z13 + z2; p[24] = z13 - z2;
-        p[8] = z11 + z4; p[56] = z11 - z4;
+}
+
+/* 2×2 の平均(libjpeg の h2v2_downsample と同じ丸め: 1, 2, 1, 2 を足す)。W2 は 8 の倍数 */
+static void down_h2v2(const short *a, const short *b, short *out, int W2)
+{
+    const __m128i ones = _mm_set1_epi16(1), bias = _mm_set_epi32(2, 1, 2, 1);
+    int x;
+    for (x = 0; x < W2; x += 8) {
+        __m128i s0 = _mm_add_epi32(_mm_madd_epi16(_mm_loadu_si128((const __m128i *)(a + 2 * x)), ones),
+                                   _mm_madd_epi16(_mm_loadu_si128((const __m128i *)(b + 2 * x)), ones));
+        __m128i s1 = _mm_add_epi32(_mm_madd_epi16(_mm_loadu_si128((const __m128i *)(a + 2 * x + 8)), ones),
+                                   _mm_madd_epi16(_mm_loadu_si128((const __m128i *)(b + 2 * x + 8)), ones));
+        s0 = _mm_srai_epi32(_mm_add_epi32(s0, bias), 2);
+        s1 = _mm_srai_epi32(_mm_add_epi32(s1, bias), 2);
+        _mm_storeu_si128((__m128i *)(out + x), _mm_packs_epi32(s0, s1));
     }
+}
+
+/* 横 2 つの平均(h2v1_downsample と同じ: 0, 1, 0, 1 を足す) */
+static void down_h2v1(const short *a, short *out, int W2)
+{
+    const __m128i ones = _mm_set1_epi16(1), bias = _mm_set_epi32(1, 0, 1, 0);
+    int x;
+    for (x = 0; x < W2; x += 8) {
+        __m128i s0 = _mm_madd_epi16(_mm_loadu_si128((const __m128i *)(a + 2 * x)), ones);
+        __m128i s1 = _mm_madd_epi16(_mm_loadu_si128((const __m128i *)(a + 2 * x + 8)), ones);
+        s0 = _mm_srai_epi32(_mm_add_epi32(s0, bias), 1);
+        s1 = _mm_srai_epi32(_mm_add_epi32(s1, bias), 1);
+        _mm_storeu_si128((__m128i *)(out + x), _mm_packs_epi32(s0, s1));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  DCT(libjpeg の jfdctint.c と同じ計算を 8 本同時に)                 */
+/* ------------------------------------------------------------------ */
+
+#define CONST_BITS 13
+#define PASS1_BITS 2
+#define F_0_298  2446
+#define F_0_390  3196
+#define F_0_541  4433
+#define F_0_765  6270
+#define F_0_899  7373
+#define F_1_175  9633
+#define F_1_501 12299
+#define F_1_847 15137
+#define F_1_961 16069
+#define F_2_053 16819
+#define F_2_562 20995
+#define F_3_072 25172
+
+static __forceinline void transpose8(__m128i *r)
+{
+    __m128i a0 = _mm_unpacklo_epi16(r[0], r[1]), a1 = _mm_unpackhi_epi16(r[0], r[1]);
+    __m128i a2 = _mm_unpacklo_epi16(r[2], r[3]), a3 = _mm_unpackhi_epi16(r[2], r[3]);
+    __m128i a4 = _mm_unpacklo_epi16(r[4], r[5]), a5 = _mm_unpackhi_epi16(r[4], r[5]);
+    __m128i a6 = _mm_unpacklo_epi16(r[6], r[7]), a7 = _mm_unpackhi_epi16(r[6], r[7]);
+    __m128i b0 = _mm_unpacklo_epi32(a0, a2), b1 = _mm_unpackhi_epi32(a0, a2);
+    __m128i b2 = _mm_unpacklo_epi32(a1, a3), b3 = _mm_unpackhi_epi32(a1, a3);
+    __m128i b4 = _mm_unpacklo_epi32(a4, a6), b5 = _mm_unpackhi_epi32(a4, a6);
+    __m128i b6 = _mm_unpacklo_epi32(a5, a7), b7 = _mm_unpackhi_epi32(a5, a7);
+    r[0] = _mm_unpacklo_epi64(b0, b4); r[1] = _mm_unpackhi_epi64(b0, b4);
+    r[2] = _mm_unpacklo_epi64(b1, b5); r[3] = _mm_unpackhi_epi64(b1, b5);
+    r[4] = _mm_unpacklo_epi64(b2, b6); r[5] = _mm_unpackhi_epi64(b2, b6);
+    r[6] = _mm_unpacklo_epi64(b3, b7); r[7] = _mm_unpackhi_epi64(b3, b7);
+}
+
+/* 32 ビットの組(lo, hi)を 2^n で割って丸め、16 ビットに */
+static __forceinline __m128i desc(__m128i lo, __m128i hi, int n)
+{
+    const __m128i rnd = _mm_set1_epi32(1 << (n - 1));
+    return _mm_packs_epi32(_mm_srai_epi32(_mm_add_epi32(lo, rnd), n), _mm_srai_epi32(_mm_add_epi32(hi, rnd), n));
+}
+
+/* d[0..7] の各列(レーン)ごとに 1 次元の DCT。pass 1 は PASS1_BITS だけ大きく残し、pass 2 で戻す。
+ * 掛け算は libjpeg の式を 2 項ずつ pmaddwd にまとめたもの(結果は同じ)。 */
+static __forceinline void dct1d(__m128i *d, int pass)
+{
+    const int n = pass == 1 ? CONST_BITS - PASS1_BITS : CONST_BITS + PASS1_BITS;
+    __m128i t0 = _mm_add_epi16(d[0], d[7]), t7 = _mm_sub_epi16(d[0], d[7]);
+    __m128i t1 = _mm_add_epi16(d[1], d[6]), t6 = _mm_sub_epi16(d[1], d[6]);
+    __m128i t2 = _mm_add_epi16(d[2], d[5]), t5 = _mm_sub_epi16(d[2], d[5]);
+    __m128i t3 = _mm_add_epi16(d[3], d[4]), t4 = _mm_sub_epi16(d[3], d[4]);
+    __m128i t10 = _mm_add_epi16(t0, t3), t13 = _mm_sub_epi16(t0, t3);
+    __m128i t11 = _mm_add_epi16(t1, t2), t12 = _mm_sub_epi16(t1, t2);
+    __m128i lo, hi, z3L, z3H, z4L, z4H, k;
+
+    if (pass == 1) {
+        d[0] = _mm_slli_epi16(_mm_add_epi16(t10, t11), PASS1_BITS);
+        d[4] = _mm_slli_epi16(_mm_sub_epi16(t10, t11), PASS1_BITS);
+    } else {
+        const __m128i two = _mm_set1_epi16(1 << (PASS1_BITS - 1));
+        d[0] = _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(t10, t11), two), PASS1_BITS);
+        d[4] = _mm_srai_epi16(_mm_add_epi16(_mm_sub_epi16(t10, t11), two), PASS1_BITS);
+    }
+    /* 偶数: z1 = (t12 + t13) * 0.541 */
+    lo = _mm_unpacklo_epi16(t13, t12); hi = _mm_unpackhi_epi16(t13, t12);
+    k = PAIR(F_0_541 + F_0_765, F_0_541);
+    d[2] = desc(_mm_madd_epi16(lo, k), _mm_madd_epi16(hi, k), n);
+    k = PAIR(F_0_541, F_0_541 - F_1_847);
+    d[6] = desc(_mm_madd_epi16(lo, k), _mm_madd_epi16(hi, k), n);
+
+    /* 奇数: z3 = (t4 + t6)、z4 = (t5 + t7)、z5 = (z3 + z4) * 1.175 */
+    {
+        __m128i z3 = _mm_add_epi16(t4, t6), z4 = _mm_add_epi16(t5, t7);
+        lo = _mm_unpacklo_epi16(z3, z4); hi = _mm_unpackhi_epi16(z3, z4);
+        k = PAIR(F_1_175 - F_1_961, F_1_175);
+        z3L = _mm_madd_epi16(lo, k); z3H = _mm_madd_epi16(hi, k);
+        k = PAIR(F_1_175, F_1_175 - F_0_390);
+        z4L = _mm_madd_epi16(lo, k); z4H = _mm_madd_epi16(hi, k);
+    }
+    lo = _mm_unpacklo_epi16(t4, t7); hi = _mm_unpackhi_epi16(t4, t7);
+    k = PAIR(F_0_298 - F_0_899, -F_0_899);
+    d[7] = desc(_mm_add_epi32(_mm_madd_epi16(lo, k), z3L), _mm_add_epi32(_mm_madd_epi16(hi, k), z3H), n);
+    k = PAIR(-F_0_899, F_1_501 - F_0_899);
+    d[1] = desc(_mm_add_epi32(_mm_madd_epi16(lo, k), z4L), _mm_add_epi32(_mm_madd_epi16(hi, k), z4H), n);
+    lo = _mm_unpacklo_epi16(t5, t6); hi = _mm_unpackhi_epi16(t5, t6);
+    k = PAIR(F_2_053 - F_2_562, -F_2_562);
+    d[5] = desc(_mm_add_epi32(_mm_madd_epi16(lo, k), z4L), _mm_add_epi32(_mm_madd_epi16(hi, k), z4H), n);
+    k = PAIR(-F_2_562, F_3_072 - F_2_562);
+    d[3] = desc(_mm_add_epi32(_mm_madd_epi16(lo, k), z3L), _mm_add_epi32(_mm_madd_epi16(hi, k), z3H), n);
 }
 
 static __forceinline int nbits(int v)
@@ -216,34 +399,62 @@ static __forceinline int nbits(int v)
     return (int)idx + 1;
 }
 
-static void encode_block(JW *w, float *blk, const float *div, int *lastDc, const HTab *dc, const HTab *ac)
+/* 平面の 8×8(src から、1 行 stride 個)を DCT・量子化してハフマン符号に */
+static void encode_block(JW *w, const short *src, int stride, const unsigned short (*qt)[64],
+                         int *lastDc, const HTab *dc, const HTab *ac)
 {
-    int q[64], i, run, diff, n;
+    __declspec(align(16)) short t[64], zz[64];
+    const __m128i zero = _mm_setzero_si128(), lim = _mm_set1_epi16(1023), nlim = _mm_set1_epi16(-1023);
+    __m128i d[8];
+    unsigned long long nz = 0;
+    unsigned long idx;
+    int i, n, diff, dcv = 0, last;
 
-    fdct(blk);
-    for (i = 0; i < 64; i++) {
-        float v = blk[k_zigzag[i]] * div[k_zigzag[i]];
-        q[i] = (int)(v < 0 ? v - 0.5f : v + 0.5f);
+    for (i = 0; i < 8; i++) d[i] = _mm_loadu_si128((const __m128i *)(src + (size_t)i * stride));
+    dct1d(d, 1);            /* 縦 */
+    transpose8(d);
+    dct1d(d, 2);            /* 横。d[k] のレーン m = 係数[m][k] */
+
+    for (i = 0; i < 8; i++) {
+        __m128i x = d[i], s = _mm_srai_epi16(x, 15);
+        __m128i a = _mm_sub_epi16(_mm_xor_si128(x, s), s);
+        a = _mm_add_epi16(a, _mm_loadu_si128((const __m128i *)(qt[1] + i * 8)));
+        a = _mm_mulhi_epu16(a, _mm_loadu_si128((const __m128i *)(qt[0] + i * 8)));
+        a = _mm_mulhi_epu16(a, _mm_loadu_si128((const __m128i *)(qt[2] + i * 8)));
+        a = _mm_sub_epi16(_mm_xor_si128(a, s), s);
+        if (!i) dcv = (short)_mm_cvtsi128_si32(a);
+        a = _mm_min_epi16(_mm_max_epi16(a, nlim), lim);     /* ベースラインの AC は 10 ビットまで */
+        _mm_store_si128((__m128i *)(t + i * 8), a);
     }
-    /* ベースラインの AC は 10 ビットまで */
-    for (i = 1; i < 64; i++) q[i] = q[i] > 1023 ? 1023 : q[i] < -1023 ? -1023 : q[i];
-    diff = q[0] - *lastDc;
-    *lastDc = q[0];
+    t[0] = (short)dcv;
+    for (i = 0; i < 64; i++) zz[i] = t[g_tzig[i]];
+    for (i = 0; i < 4; i++) {
+        __m128i a = _mm_load_si128((const __m128i *)(zz + i * 16));
+        __m128i b = _mm_load_si128((const __m128i *)(zz + i * 16 + 8));
+        unsigned bits = (unsigned)_mm_movemask_epi8(_mm_packs_epi16(_mm_cmpeq_epi16(a, zero), _mm_cmpeq_epi16(b, zero)));
+        nz |= (unsigned long long)bits << (i * 16);
+    }
+    nz = ~nz & ~1ull;
+
+    diff = zz[0] - *lastDc;
+    *lastDc = zz[0];
     n = nbits(diff);
-    jw_put(w, dc->code[n], dc->size[n]);
-    if (n) jw_put(w, (unsigned)(diff < 0 ? diff - 1 : diff) & ((1u << n) - 1), n);
+    jw_put(w, ((unsigned)dc->code[n] << n) | ((unsigned)(diff < 0 ? diff - 1 : diff) & ((1u << n) - 1)), dc->size[n] + n);
 
-    run = 0;
-    for (i = 1; i < 64; i++) {
-        int v = q[i];
-        if (!v) { run++; continue; }
+    last = 0;
+    while (nz) {
+        int run, v, sym;
+        _BitScanForward64(&idx, nz);
+        nz &= nz - 1;
+        run = (int)idx - last - 1;
         while (run > 15) { jw_put(w, ac->code[0xF0], ac->size[0xF0]); run -= 16; }
+        v = zz[idx];
         n = nbits(v);
-        jw_put(w, ac->code[(run << 4) | n], ac->size[(run << 4) | n]);
-        jw_put(w, (unsigned)(v < 0 ? v - 1 : v) & ((1u << n) - 1), n);
-        run = 0;
+        sym = (run << 4) | n;
+        jw_put(w, ((unsigned)ac->code[sym] << n) | ((unsigned)(v < 0 ? v - 1 : v) & ((1u << n) - 1)), ac->size[sym] + n);
+        last = (int)idx;
     }
-    if (run) jw_put(w, ac->code[0], ac->size[0]);
+    if (last != 63) jw_put(w, ac->code[0], ac->size[0]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -308,77 +519,71 @@ static unsigned char *put_headers(const JpegEnc *e, unsigned char *p, int w, int
 /*  本体                                                                */
 /* ------------------------------------------------------------------ */
 
-/* MCU の範囲(端は最後の画素を繰り返す)を Y / Cb / Cr の平面に取り出す */
-static void load_mcu(const unsigned char *px, int stride, int w, int h, int x0, int y0, int mw, int mh,
-                     float *Y, float *Cb, float *Cr)
-{
-    int x, y;
-    for (y = 0; y < mh; y++) {
-        int sy = y0 + y < h ? y0 + y : h - 1;
-        const unsigned char *row = px + (size_t)sy * (size_t)stride;
-        for (x = 0; x < mw; x++) {
-            int sx = x0 + x < w ? x0 + x : w - 1;
-            const unsigned char *s = row + sx * 4;
-            float b = s[0], g = s[1], r = s[2];
-            int i = y * mw + x;
-            Y[i]  =  0.299f * r + 0.587f * g + 0.114f * b - 128.0f;
-            Cb[i] = -0.168735892f * r - 0.331264108f * g + 0.5f * b;
-            Cr[i] =  0.5f * r - 0.418687589f * g - 0.081312411f * b;
-        }
-    }
-}
-
 size_t jpe_encode(JpegEnc *e, const unsigned char *px, int stride, int w, int h,
                   int quality, int subsamp, unsigned char *out, size_t cap)
 {
-    float Y[256], Cb[256], Cr[256], blk[64];
-    int   mw = subsamp == JPE_444 ? 8 : 16, mh = subsamp == JPE_420 ? 16 : 8;
-    int   dcY = 0, dcCb = 0, dcCr = 0, mx, my, bx, by, x, y;
+    int    mw = subsamp == JPE_444 ? 8 : 16, mh = subsamp == JPE_420 ? 16 : 8;
+    int    dcY = 0, dcCb = 0, dcCr = 0, mx, my, bx, by, r, W, cw;
     const size_t worstMcu = 6 * 420 + 64;      /* 1 ブロック最大 約 206 バイト、0xFF の詰め物で倍 */
-    JW    jw;
+    size_t need;
+    short *Y, *Cb, *Cr, *Cb2, *Cr2, *pcb, *pcr;
+    JW     jw;
 
     if (w <= 0 || h <= 0 || w > 65535 || h > 65535 || cap < 1024) return 0;
+    W = (w + mw - 1) / mw * mw;
+    need = (size_t)W * (size_t)mh * 3 + (size_t)W * 8;
+    if (need > e->planeCap) {
+        short *p = (short *)realloc(e->plane, need * sizeof(short));
+        if (!p) return 0;
+        e->plane = p;
+        e->planeCap = need;
+    }
+    Y = e->plane;
+    Cb = Y + (size_t)W * mh;
+    Cr = Cb + (size_t)W * mh;
+    Cb2 = Cr + (size_t)W * mh;
+    Cr2 = Cb2 + (size_t)(W / 2) * 8;
+    cw = subsamp == JPE_444 ? W : W / 2;
+    pcb = subsamp == JPE_444 ? Cb : Cb2;
+    pcr = subsamp == JPE_444 ? Cr : Cr2;
+
     set_quality(e, quality);
     jw.p = put_headers(e, out, w, h, subsamp);
     jw.buf = 0;
     jw.cnt = 0;
 
     for (my = 0; my < h; my += mh) {
-        for (mx = 0; mx < w; mx += mw) {
-            if ((size_t)(jw.p - out) + worstMcu > cap) return 0;
-            load_mcu(px, stride, w, h, mx, my, mw, mh, Y, Cb, Cr);
-            for (by = 0; by < mh; by += 8)
-                for (bx = 0; bx < mw; bx += 8) {
-                    for (y = 0; y < 8; y++) memcpy(blk + y * 8, Y + (by + y) * mw + bx, 8 * sizeof(float));
-                    encode_block(&jw, blk, e->dLum, &dcY, &g_dcLum, &g_acLum);
-                }
-            if (subsamp == JPE_444) {
-                memcpy(blk, Cb, sizeof(blk));
-                encode_block(&jw, blk, e->dChr, &dcCb, &g_dcChr, &g_acChr);
-                memcpy(blk, Cr, sizeof(blk));
-                encode_block(&jw, blk, e->dChr, &dcCr, &g_dcChr, &g_acChr);
-            } else {
-                float cr[64];
-                for (y = 0; y < 8; y++)
-                    for (x = 0; x < 8; x++) {
-                        if (subsamp == JPE_420) {
-                            int i = (y * 2) * 16 + x * 2;
-                            blk[y * 8 + x] = (Cb[i] + Cb[i + 1] + Cb[i + 16] + Cb[i + 17]) * 0.25f;
-                            cr[y * 8 + x]  = (Cr[i] + Cr[i + 1] + Cr[i + 16] + Cr[i + 17]) * 0.25f;
-                        } else {
-                            int i = y * 16 + x * 2;
-                            blk[y * 8 + x] = (Cb[i] + Cb[i + 1]) * 0.5f;
-                            cr[y * 8 + x]  = (Cr[i] + Cr[i + 1]) * 0.5f;
-                        }
-                    }
-                encode_block(&jw, blk, e->dChr, &dcCb, &g_dcChr, &g_acChr);
-                encode_block(&jw, cr, e->dChr, &dcCr, &g_dcChr, &g_acChr);
+        convert_rows(px, stride, w, h, my, mh, W, Y, Cb, Cr);
+        if (subsamp == JPE_420) {
+            for (r = 0; r < 8; r++) {
+                down_h2v2(Cb + (size_t)(2 * r) * W, Cb + (size_t)(2 * r + 1) * W, Cb2 + (size_t)r * cw, cw);
+                down_h2v2(Cr + (size_t)(2 * r) * W, Cr + (size_t)(2 * r + 1) * W, Cr2 + (size_t)r * cw, cw);
+            }
+        } else if (subsamp == JPE_422) {
+            for (r = 0; r < 8; r++) {
+                down_h2v1(Cb + (size_t)r * W, Cb2 + (size_t)r * cw, cw);
+                down_h2v1(Cr + (size_t)r * W, Cr2 + (size_t)r * cw, cw);
             }
         }
+        for (mx = 0; mx < W; mx += mw) {
+            int cx = subsamp == JPE_444 ? mx : mx / 2;
+            if ((size_t)(jw.p - out) + worstMcu > cap) return 0;
+            for (by = 0; by < mh; by += 8)
+                for (bx = 0; bx < mw; bx += 8)
+                    encode_block(&jw, Y + (size_t)by * W + mx + bx, W, e->qt[0], &dcY, &g_dcLum, &g_acLum);
+            encode_block(&jw, pcb + cx, cw, e->qt[1], &dcCb, &g_dcChr, &g_acChr);
+            encode_block(&jw, pcr + cx, cw, e->qt[1], &dcCr, &g_dcChr, &g_acChr);
+        }
     }
-    if (jw.cnt & 7) {                   /* 端数のビットを 1 で埋める(幅ちょうどの値で) */
-        int pad = 8 - (jw.cnt & 7);
-        jw_put(&jw, (1u << pad) - 1, pad);
+    {
+        int pad = (8 - (jw.cnt & 7)) & 7;      /* 端数のビットを 1 で埋める */
+        if (pad) jw_put(&jw, (1u << pad) - 1, pad);
+        while (jw.cnt >= 8) {
+            unsigned char c = (unsigned char)(jw.buf >> (jw.cnt - 8));
+            *jw.p++ = c;
+            if (c == 0xFF) *jw.p++ = 0;
+            jw.cnt -= 8;
+        }
     }
     *jw.p++ = 0xFF;
     *jw.p++ = 0xD9;

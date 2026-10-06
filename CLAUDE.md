@@ -79,6 +79,46 @@ VNC 認証・Tight + JPEG・CopyRect・カーソル・QEMU キー・拡張クリ
 - 画面の大きさが変わる前に受けた「要求の範囲」を、縮んだ後の変化の表に当てて範囲外を読み、落ちていた
   (`-testresize` で見つけた)。要求の範囲は書き手のスレッドで今の画面に切り詰める。
 
+### ほかのサーバーとの比べ合いと高速化(2026-10-06、server v8 / client v10)
+
+**比べ方。** `tools/srcwin.py` が最前面・非アクティブの窓(物理座標 (200,200) から 1280×720)に決まった動きを
+60fps で描き、左上の 16 升にフレーム番号を白黒で描いて、DwmFlush の後の時刻(QPC)を記録する。
+`tools/compare.py --port <p> --pid <サーバーの PID> --scene office|video|idle --quality hq|std|lossless` が
+その窓を出しながら差分の要求を出し続け、縞に重なる矩形だけ復号して番号を読み、遅れ・見えたフレーム・サーバーの CPU を出す。
+iivnc-server は `-dryrun` と `listen=127.0.0.1` の ini(`build/test/bench.ini`、5913)で動かす。
+
+- 他社のサーバー: UltraVNC 1.8.3 は `winvnc.exe` などを scratch へ写し、隣に **`ultravnc.portable`(空のファイル)**を
+  置くと隣の `ultravnc.ini` を読む(置かないと `C:\ProgramData\UltraVNC\ultravnc.ini` を読み、0.0.0.0:5900 で
+  待ち受ける。一度そうなってすぐ止めた)。`LoopbackOnly=1`、`AllowLoopback=1`、`AuthRequired=0`、`PortNumber=5911`。
+  既定の `MaxCpu=40` だと 21.5 更新/秒で頭打ちなので `MaxCpu=100`、`MaxFPS=60` にして比べた。
+  TightVNC 2.8.90 は `HKCU\Software\TightVNC\Server` に `RfbPort=5912`、`LoopbackOnly=1`、`AllowLoopback=1`、
+  `UseVncAuthentication=0` を書いて `tvnserver.exe -run`。
+- 全体の要求(`bench.py --mode full`)での比べ合いは公平でない。UltraVNC は JPEG のとき全体の要求にも数 KB しか返さない。
+- 結果は README の表。iivnc はどの絵でも見えたフレーム・遅れで一番。CPU は UltraVNC より多い。
+
+**JPEG を SSE2 で作り直した(jpegenc.c)。** v7 の浮動小数点・1 画素ずつの版は libjpeg-turbo の約 6 倍遅かった
+(1280×720・JPEG 95・4:4:4 で 17.3ms 対 2.9ms)。色の変換は 15 ビットの固定小数点で 8 画素ずつ、DCT は libjpeg の
+islow を 8 本同時(縦→転置→横。結果は転置した並びのまま、量子化表とジグザグの表を読み替える)、量子化は libjpeg-turbo
+の逆数・補正・倍率、ハフマンは 0 でない係数の 64 ビットの地図を飛び越す。3.4ms になり、大きさ・PSNR は PIL と同じ
+(両者の差 PSNR 55〜63dB)。AVX2 は Windows 10 の古い CPU(Celeron など)に無いので使っていない。
+実画面の動画の絵で、サーバーの CPU 174% → 44%(交互に 3 回ずつ)。
+
+**GPU を待つ間の空回り(やめたこと)。** プロセスの CPU をスレッドごとに見ると(QueryThreadCycleTime と
+NtQueryInformationThread の開始アドレス)、縞だけ変わる絵で 8 割が `nvwgf2umx.dll` のスレッドだった。
+`D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS` を付けると、同じ量が取り込みスレッドの `Map` へ移る
+(1 回 17.7M サイクル = 経過 5.2ms。GPU の写しを待つ間ずっと回る)。`ID3D11Fence` + イベントで眠って待つと CPU は
+21% → 6% になるが、受け手に見えたフレームが 56.4 → 52.3/秒に落ちた(交互に 3 回ずつ。`ThreadPowerThrottling` で
+省電力の扱いを外しても変わらない)。なめらかさを優先して入れていない。クライアントの送り出し用テクスチャでは
+フェンスで待っても更新の回数は落ちなかったので、クライアントには入れた。
+
+**deflate は速くしなかった。** 同じ条件(49KB ずつ、直前 32KB を辞書)で zlib-ng レベル 1 より速く小さい
+(デスクトップ風 640 対 490MB/s、6.7% 対 9.9%)。ハッシュ表を毎回 0 で埋めるのをやめても差は無く、辞書の登録を
+4 つに 1 つへ間引くと +10% だが少し大きくなる。
+
+**展開を速くした(zinflate.c、クライアントと同じファイル)。** 入力・出力に余裕がある間は確かめを省く速い道
+(`fast_huff`)と 8 バイトずつの一致の写し。デスクトップ風 1050 → 1600MB/s(zlib-ng 1480)、文字 412 → 520(585)。
+`fuzz_zlite.py` 300 回で不一致 0。表を 11 ビットにしても変わらなかった。
+
 ### サービス(v2、svc.c)
 
 構成は 4 つの動き方(同じ exe): `-service`(SCM、セッション 0、SYSTEM)が、コンソールのセッションへ

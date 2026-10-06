@@ -35,8 +35,8 @@
 #include "zlite.h"
 
 #define APP_NAME     L"iivnc-server"
-#define APP_VERSION  L"1.6.0"
-#define APP_VERSION_A "1.6.0"
+#define APP_VERSION  L"1.7.0"
+#define APP_VERSION_A "1.7.0"
 
 #define WM_APP_TRAY     (WM_APP + 1)
 #define WM_APP_COMMAND  (WM_APP + 2)    /* 別のプロセスから(-exit など) */
